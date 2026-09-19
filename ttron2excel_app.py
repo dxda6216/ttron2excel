@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import json
 import math
 import os
 import queue
@@ -297,23 +298,106 @@ def find_peaks_and_troughs(
     return valid.index[peaks], valid.index[troughs]
 
 
-def peaks_and_troughs_table(smoothed: pd.DataFrame, time_interval: float) -> pd.DataFrame:
-    """One row per detected peak/trough across all channels."""
-    rows = []
+PeakSelection = dict  # channel -> (list of peak row labels, list of trough row labels)
+
+
+def detect_all_peaks(smoothed: pd.DataFrame, time_interval: float) -> PeakSelection:
+    """Automatic detection for every channel (row labels of `smoothed`)."""
+    result = {}
     for channel in CHANNELS:
         peaks, troughs = find_peaks_and_troughs(
             smoothed[channel], PEAK_MIN_SEPARATION_HOURS, time_interval
         )
-        for kind, indices in (("Peak", peaks), ("Trough", troughs)):
+        result[channel] = ([int(i) for i in peaks], [int(i) for i in troughs])
+    return result
+
+
+def peaks_and_troughs_table(
+    smoothed: pd.DataFrame,
+    time_interval: float,
+    selection: PeakSelection | None = None,
+    auto: PeakSelection | None = None,
+) -> pd.DataFrame:
+    """One row per peak/trough across all channels.
+
+    `selection` is the (possibly hand-edited) set to report; `auto` is what the
+    automatic detection found, so each row can be labelled Auto or Manual.
+    """
+    if selection is None:
+        selection = detect_all_peaks(smoothed, time_interval)
+    if auto is None:
+        auto = selection
+    rows = []
+    for channel in CHANNELS:
+        peaks, troughs = selection[channel]
+        auto_peaks, auto_troughs = auto[channel]
+        for kind, indices, automatic in (
+            ("Peak", peaks, auto_peaks),
+            ("Trough", troughs, auto_troughs),
+        ):
             for index in indices:
                 rows.append(
                     {
                         "Channel": channel,
                         "Type": kind,
                         "Time (Hours)": smoothed.loc[index, "Hours"],
+                        "Source": "Auto" if index in automatic else "Manual",
                     }
                 )
-    return pd.DataFrame(rows, columns=["Channel", "Type", "Time (Hours)"])
+    return pd.DataFrame(rows, columns=["Channel", "Type", "Time (Hours)", "Source"])
+
+
+def selection_differs(selection: PeakSelection, auto: PeakSelection) -> bool:
+    return any(
+        sorted(selection[ch][0]) != sorted(auto[ch][0])
+        or sorted(selection[ch][1]) != sorted(auto[ch][1])
+        for ch in CHANNELS
+    )
+
+
+PEAKS_JSON_FORMAT = "ttron-peaks-v1"
+
+
+def save_peaks_json(path, selection: PeakSelection, hours: pd.Series, traces_file: str) -> None:
+    """Save the peak/trough selection (by time, so it survives re-processing)."""
+    payload = {
+        "format": PEAKS_JSON_FORMAT,
+        "traces_file": traces_file,
+        "channels": {
+            channel: {
+                "peaks": [float(hours.loc[i]) for i in peaks],
+                "troughs": [float(hours.loc[i]) for i in troughs],
+            }
+            for channel, (peaks, troughs) in selection.items()
+        },
+    }
+    Path(path).write_text(json.dumps(payload, indent=1), encoding="utf-8")
+
+
+def load_peaks_json(path, hours: pd.Series) -> tuple[PeakSelection, int]:
+    """Load a saved selection. Returns (selection, number of times not matched)."""
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("format") != PEAKS_JSON_FORMAT:
+        raise ValueError("This is not a peaks/troughs file saved by this application.")
+    valid = hours.dropna()
+    skipped = 0
+
+    def to_rows(times) -> list[int]:
+        nonlocal skipped
+        rows = set()
+        for hour in times:
+            nearest = (valid - float(hour)).abs().idxmin()
+            if abs(float(valid.loc[nearest]) - float(hour)) <= 1e-3:
+                rows.add(int(nearest))
+            else:
+                skipped += 1
+        return sorted(rows)
+
+    result = {}
+    for channel, entry in payload.get("channels", {}).items():
+        if channel in CHANNELS:
+            result[channel] = (to_rows(entry.get("peaks", [])), to_rows(entry.get("troughs", [])))
+    return result, skipped
 
 
 # --------------------------------------------------------------------------- #
@@ -597,6 +681,7 @@ def plot_channel_page(
     last_hour: float,
     label_peaks: bool,
     label_actogram: bool,
+    peaks_troughs: tuple | None = None,
 ) -> None:
     """One page per channel: raw + trend, detrended + peaks, actogram."""
     with plt.rc_context(CHANNEL_PAGE_RC):
@@ -629,9 +714,12 @@ def plot_channel_page(
             linewidth=1.0, label="Smoothed line (9-point moving average, centered)",
         )
 
-        peaks, troughs = find_peaks_and_troughs(
-            detrended_smoothed[channel], PEAK_MIN_SEPARATION_HOURS, time_interval
-        )
+        if peaks_troughs is None:
+            peaks, troughs = find_peaks_and_troughs(
+                detrended_smoothed[channel], PEAK_MIN_SEPARATION_HOURS, time_interval
+            )
+        else:  # hand-edited selection from the review window
+            peaks, troughs = peaks_troughs
         y_span = None
         for indices, color, label, offset_sign, va in (
             (peaks, "red", "Peaks", 1, "bottom"),
@@ -924,22 +1012,121 @@ def expected_outputs(input_path, output_dir, settings: Settings) -> list[Path]:
     ]
 
 
-def run_analysis(input_path, output_dir, settings: Settings, progress=None) -> list[Path]:
-    """Convert one TRACES file. Returns the list of files written.
+@dataclass
+class Analysis:
+    """Everything computed before any output file is written."""
 
-    Progress messages are written with print(); ``progress(fraction, text)`` is
-    called (fraction in 0..1) so a GUI can drive a progress bar.
-    """
+    input_path: Path
+    settings: Settings
+    recording: Recording
+    time_interval: float
+    smoothed: dict
+    trend: Trend
+    detrended: pd.DataFrame
+    detrended_smoothed: dict
+    auto_peaks: PeakSelection
 
+    @property
+    def raw(self) -> pd.DataFrame:
+        return self.recording.data
+
+    @property
+    def detrended_9pma(self) -> pd.DataFrame:
+        return self.detrended_smoothed[9]
+
+
+def _reporter(progress):
     def report(fraction: float, text: str) -> None:
         if progress is not None:
             progress(min(max(fraction, 0.0), 1.0), text)
 
+    return report
+
+
+def analyze(input_path, settings: Settings, progress=None) -> Analysis:
+    """Read, smooth, detrend and detect peaks/troughs (no files are written).
+
+    Progress messages are written with print(); ``progress(fraction, text)`` is
+    called (fraction in 0..1) so a GUI can drive a progress bar.
+    """
+    report = _reporter(progress)
     s = settings
     input_path = Path(input_path)
+
+    start_time = utc_now()
+    print(f"Started at {start_time:%Y-%m-%d %H:%M:%S} (UTC)")
+
+    report(0.0, "Reading the data...")
+    print(f"\nReading {input_path.name} ...")
+    recording = read_traces(str(input_path))
+    raw = recording.data
+    if recording.n_points < 10:
+        raise ValueError(
+            f"Only {recording.n_points} data rows were read. "
+            "Is this really a Taylortron TRACES.nnn file?"
+        )
+    time_interval = recording.time_interval
+    recording.describe()
+
+    report(0.3, "Detrending...")
+    print(f"\nCalculating trend line and detrended data using {s.detrending_method}...")
+    smoothed = {window: rolling_mean(raw, window) for window in SMOOTHING_WINDOWS}
+    trend = build_trend(
+        raw,
+        s.detrending_method,
+        time_interval,
+        window_hours=s.moving_average_window,
+        cutoff_period_hours=s.sinc_cutoff_period_hours,
+        order=int(s.sinc_order),
+    )
+    detrended = detrend(raw, trend.data)
+    detrended_smoothed = {w: rolling_mean(detrended, w) for w in SMOOTHING_WINDOWS}
+
+    report(0.8, "Detecting peaks and troughs...")
+    auto_peaks = detect_all_peaks(detrended_smoothed[9], time_interval)
+    print("\nAnalysis finished.")
+    report(1.0, "Analysis finished")
+
+    return Analysis(
+        input_path=input_path,
+        settings=settings,
+        recording=recording,
+        time_interval=time_interval,
+        smoothed=smoothed,
+        trend=trend,
+        detrended=detrended,
+        detrended_smoothed=detrended_smoothed,
+        auto_peaks=auto_peaks,
+    )
+
+
+def write_outputs(
+    analysis: Analysis,
+    output_dir,
+    peaks: PeakSelection | None = None,
+    progress=None,
+) -> list[Path]:
+    """Write the Excel files, ZIP and PDF. Returns the list of files written.
+
+    `peaks` is the peak/trough selection to use (default: automatic detection).
+    """
+    report = _reporter(progress)
+    s = analysis.settings
+    recording = analysis.recording
+    raw = analysis.raw
+    time_interval = analysis.time_interval
+    trend = analysis.trend
+    detrended = analysis.detrended
+    smoothed = analysis.smoothed
+    detrended_smoothed = analysis.detrended_smoothed
+    detrended_9pma = analysis.detrended_9pma
+    input_path = analysis.input_path
+    if peaks is None:
+        peaks = analysis.auto_peaks
+    edited = selection_differs(peaks, analysis.auto_peaks)
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
     main_workbook, raw_workbook, fit_workbook, zip_archive, plot_pdf = expected_outputs(
         input_path, output_dir, s
     )
@@ -958,36 +1145,7 @@ def run_analysis(input_path, output_dir, settings: Settings, progress=None) -> l
         print(f"Fitting window was shorter than 24 h; using {start_hour}-{end_hour} h instead.")
 
     start_time = utc_now()
-    print(f"Started at {start_time:%Y-%m-%d %H:%M:%S} (UTC)")
-
-    # ---- read ------------------------------------------------------------ #
-    report(0.0, "Reading the data...")
-    print(f"\nReading {input_path.name} ...")
-    recording = read_traces(str(input_path))
-    raw = recording.data
-    if recording.n_points < 10:
-        raise ValueError(
-            f"Only {recording.n_points} data rows were read. "
-            "Is this really a Taylortron TRACES.nnn file?"
-        )
-    time_interval = recording.time_interval
-    recording.describe()
-
-    # ---- smooth and detrend --------------------------------------------- #
-    report(0.05, "Detrending...")
-    print(f"\nCalculating trend line and detrended data using {s.detrending_method}...")
-    smoothed = {window: rolling_mean(raw, window) for window in SMOOTHING_WINDOWS}
-    trend = build_trend(
-        raw,
-        s.detrending_method,
-        time_interval,
-        window_hours=s.moving_average_window,
-        cutoff_period_hours=s.sinc_cutoff_period_hours,
-        order=int(s.sinc_order),
-    )
-    detrended = detrend(raw, trend.data)
-    detrended_smoothed = {w: rolling_mean(detrended, w) for w in SMOOTHING_WINDOWS}
-    detrended_9pma = detrended_smoothed[9]
+    print(f"\nWriting output files ({'hand-edited' if edited else 'automatic'} peaks/troughs)")
 
     # ---- Excel / .dat / zip --------------------------------------------- #
     report(0.10, "Writing Excel files...")
@@ -1004,6 +1162,7 @@ def run_analysis(input_path, output_dir, settings: Settings, progress=None) -> l
             ("Average Time Interval (Hours)", time_interval),
             ("Detrending Method", s.detrending_method),
             ("Trend Line Parameter", trend.summary),
+            ("Peaks and Troughs", "Edited manually" if edited else "Automatic detection"),
             ("", ""),
             ("Data Processed Date and Time (UTC)", utc_now_string()),
         ]
@@ -1017,7 +1176,9 @@ def run_analysis(input_path, output_dir, settings: Settings, progress=None) -> l
         trend=trend,
         detrended=detrended,
         detrended_smoothed=detrended_smoothed,
-        peaks_troughs=peaks_and_troughs_table(detrended_9pma, time_interval),
+        peaks_troughs=peaks_and_troughs_table(
+            detrended_9pma, time_interval, selection=peaks, auto=analysis.auto_peaks
+        ),
     )
     print(f"Excel file: {main_workbook.name}  has been generated.")
     report(0.20, "Writing Excel files...")
@@ -1084,6 +1245,7 @@ def run_analysis(input_path, output_dir, settings: Settings, progress=None) -> l
                 last_hour=recording.last_hour,
                 label_peaks=s.label_detrended_plot,
                 label_actogram=s.label_actogram,
+                peaks_troughs=peaks[channel],
             )
 
         print("\nPerforming damped sine curve fitting...")
@@ -1118,9 +1280,24 @@ def run_analysis(input_path, output_dir, settings: Settings, progress=None) -> l
     return outputs
 
 
+def run_analysis(
+    input_path, output_dir, settings: Settings, progress=None, peaks: PeakSelection | None = None
+) -> list[Path]:
+    """analyze() + write_outputs() in one call (no review step)."""
+    analysis = analyze(input_path, settings, progress)
+    return write_outputs(analysis, output_dir, peaks, progress)
+
+
 # =========================================================================== #
 # 2. Desktop GUI
 # =========================================================================== #
+
+def _fit_geometry(window, width: int, height: int) -> None:
+    """Set the window size, but never larger than the screen (taskbar allowance)."""
+    width = min(width, window.winfo_screenwidth() - 20)
+    height = min(height, window.winfo_screenheight() - 80)
+    window.geometry(f"{width}x{height}")
+
 
 class _QueueWriter:
     """File-like object that forwards print() output to the GUI thread."""
@@ -1143,9 +1320,11 @@ class App:
         self.queue: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
         self.last_output_dir: Path | None = None
+        self.analysis: Analysis | None = None
+        self.pending_out_dir = ""
 
         root.title(APP_TITLE)
-        root.geometry("1120x800")
+        _fit_geometry(root, 1120, 900)
         root.minsize(1000, 680)
 
         self._make_variables()
@@ -1182,6 +1361,7 @@ class App:
         self.fit_start_var = tk.IntVar(value=int(d.fit_start_hour))
         self.fit_end_var = tk.IntVar(value=int(d.fit_end_hour))
 
+        self.review_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Select a TRACES file to begin.")
         self.summary_var = tk.StringVar(value="")
 
@@ -1319,6 +1499,9 @@ class App:
         buttons.grid(row=0, column=0, sticky="ew")
         self.run_button = ttk.Button(buttons, text="Convert", command=self._on_run)
         self.run_button.pack(side="left")
+        ttk.Checkbutton(
+            buttons, text="Review peaks/troughs before export", variable=self.review_var
+        ).pack(side="left", padx=(10, 0))
         self.open_button = ttk.Button(
             buttons, text="Open output folder", command=self._open_output, state="disabled"
         )
@@ -1445,10 +1628,9 @@ class App:
         self.run_button.configure(state="disabled")
         self.open_button.configure(state="disabled")
 
-        self.worker = threading.Thread(
-            target=self._worker, args=(in_path, out_dir, settings), daemon=True
-        )
-        self.worker.start()
+        self.pending_out_dir = out_dir
+        self.analysis = None
+        self._run_in_thread(self._analysis_worker, in_path, settings)
 
     def _open_output(self) -> None:
         folder = self.last_output_dir
@@ -1468,20 +1650,55 @@ class App:
     # Background work
     # ------------------------------------------------------------------ #
 
-    def _worker(self, in_path: str, out_dir: str, settings: Settings) -> None:
-        """Runs in a background thread; talks to the GUI only through the queue."""
+    def _run_in_thread(self, target, *args) -> None:
+        self.worker = threading.Thread(target=target, args=args, daemon=True)
+        self.worker.start()
+
+    def _progress_callback(self):
+        return lambda fraction, text: self.queue.put(("progress", fraction, text))
+
+    def _analysis_worker(self, in_path: str, settings: Settings) -> None:
+        """Background thread, step 1: read, detrend and detect peaks."""
         writer = _QueueWriter(self.queue)
         try:
             with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
-                outputs = run_analysis(
-                    in_path,
-                    out_dir,
-                    settings,
-                    progress=lambda fraction, text: self.queue.put(("progress", fraction, text)),
+                analysis = analyze(in_path, settings, progress=self._progress_callback())
+            self.queue.put(("analyzed", analysis))
+        except Exception as error:  # noqa: BLE001 - shown to the user
+            self.queue.put(("error", traceback.format_exc(), str(error)))
+
+    def _export_worker(self, analysis: Analysis, out_dir: str, peaks) -> None:
+        """Background thread, step 2: write Excel / ZIP / PDF files."""
+        writer = _QueueWriter(self.queue)
+        try:
+            with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                outputs = write_outputs(
+                    analysis, out_dir, peaks, progress=self._progress_callback()
                 )
             self.queue.put(("done", outputs))
         except Exception as error:  # noqa: BLE001 - shown to the user
             self.queue.put(("error", traceback.format_exc(), str(error)))
+
+    def _on_analyzed(self, analysis: Analysis) -> None:
+        self.analysis = analysis
+        if self.review_var.get():
+            self.status_var.set("Review the detected peaks and troughs...")
+            ReviewWindow(
+                self.root, analysis, on_ok=self._start_export, on_cancel=self._on_review_cancel
+            )
+        else:
+            self._start_export(analysis.auto_peaks)
+
+    def _start_export(self, peaks) -> None:
+        self.progress["value"] = 0
+        self.status_var.set("Writing output files...")
+        self._run_in_thread(self._export_worker, self.analysis, self.pending_out_dir, peaks)
+
+    def _on_review_cancel(self) -> None:
+        self.run_button.configure(state="normal")
+        self.progress["value"] = 0
+        self.status_var.set("Cancelled. No files were written.")
+        self._append_log("\nCancelled in the review window. No files were written.\n")
 
     def _poll_queue(self) -> None:
         try:
@@ -1493,6 +1710,8 @@ class App:
                 elif kind == "progress":
                     self.progress["value"] = message[1] * 100
                     self.status_var.set(message[2])
+                elif kind == "analyzed":
+                    self._on_analyzed(message[1])
                 elif kind == "done":
                     self._on_done(message[1])
                 elif kind == "error":
@@ -1533,6 +1752,378 @@ class App:
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
+
+
+class ReviewWindow:
+    """Modal window for checking and hand-editing the detected peaks/troughs."""
+
+    HIT_RADIUS_PX = 25  # how close (in pixels) a click must be to grab a marker
+
+    HELP = (
+        "Remove: choose 'Remove' and click a marker.   "
+        "Add: choose 'Add peak' or 'Add trough' and click near the curve "
+        "(snaps to the nearest sample point).   "
+        "While a zoom/pan tool of the toolbar is active, clicks do not edit anything.   "
+        "Switch channels with the list or the Left/Right keys."
+    )
+
+    def __init__(self, parent, analysis: Analysis, on_ok, on_cancel) -> None:
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+        from matplotlib.figure import Figure
+
+        self.analysis = analysis
+        self.on_ok = on_ok
+        self.on_cancel = on_cancel
+        self.data = analysis.detrended
+        self.smooth = analysis.detrended_9pma
+        self.auto = analysis.auto_peaks
+        self.selection = {ch: (list(p), list(t)) for ch, (p, t) in self.auto.items()}
+        self.channel = CHANNELS[0]
+        self._marker_artists: list = []
+
+        win = self.win = tk.Toplevel(parent)
+        win.title("Review peaks and troughs")
+        _fit_geometry(win, 1200, 980)
+        win.minsize(900, 620)
+        win.transient(parent)
+        win.protocol("WM_DELETE_WINDOW", self._cancel)
+        win.columnconfigure(1, weight=1)
+        win.rowconfigure(1, weight=1)
+
+        self.mode_var = tk.StringVar(value="remove")
+        self.status_var = tk.StringVar(value="")
+
+        ttk.Label(win, text=self.HELP, wraplength=1120, padding=(10, 8)).grid(
+            row=0, column=0, columnspan=2, sticky="ew"
+        )
+
+        # --- channel list ------------------------------------------------- #
+        left = ttk.Frame(win, padding=(10, 0, 4, 0))
+        left.grid(row=1, column=0, sticky="ns")
+        ttk.Label(left, text="Channel   (P = peaks, T = troughs, * = edited)").pack(anchor="w")
+        list_frame = ttk.Frame(left)
+        list_frame.pack(fill="y", expand=True)
+        self.listbox = tk.Listbox(list_frame, width=26, height=30, exportselection=False)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=scrollbar.set)
+        self.listbox.pack(side="left", fill="y")
+        scrollbar.pack(side="left", fill="y")
+        for channel in CHANNELS:
+            self.listbox.insert("end", self._list_text(channel))
+        self.listbox.selection_set(0)
+        self.listbox.bind("<<ListboxSelect>>", self._on_list_select)
+
+        # --- plot area ------------------------------------------------------- #
+        centre = ttk.Frame(win, padding=(4, 0, 10, 0))
+        centre.grid(row=1, column=1, sticky="nsew")
+        controls = ttk.Frame(centre)
+        controls.pack(fill="x", pady=(0, 4))
+        for text, value in (
+            ("Remove", "remove"),
+            ("Add peak", "add_peak"),
+            ("Add trough", "add_trough"),
+        ):
+            ttk.Radiobutton(controls, text=text, value=value, variable=self.mode_var).pack(
+                side="left", padx=(0, 14)
+            )
+        ttk.Button(controls, text="Next \u25b6", command=lambda: self._step(1)).pack(side="right")
+        ttk.Button(controls, text="\u25c0 Previous", command=lambda: self._step(-1)).pack(
+            side="right", padx=4
+        )
+        ttk.Button(controls, text="Reset this channel", command=self._reset_channel).pack(
+            side="right", padx=(0, 12)
+        )
+
+        self.fig = Figure(figsize=(8, 7.2), dpi=100)
+        self.ax = self.fig.add_subplot(2, 1, 1)
+        self.ax_act = self.fig.add_subplot(2, 1, 2)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=centre)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, centre, pack_toolbar=False)
+        self.toolbar.pack(side="bottom", fill="x")
+        self.canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+        self.canvas.mpl_connect("button_press_event", self._on_click)
+
+        # --- bottom bar ------------------------------------------------------ #
+        bottom = ttk.Frame(win, padding=10)
+        bottom.grid(row=2, column=0, columnspan=2, sticky="ew")
+        ttk.Label(bottom, textvariable=self.status_var).pack(side="left")
+        ttk.Button(bottom, text="OK \u2013 export files", command=self._ok).pack(side="right")
+        ttk.Button(bottom, text="Cancel", command=self._cancel).pack(side="right", padx=6)
+        ttk.Button(bottom, text="Reset all", command=self._reset_all).pack(side="right", padx=6)
+        ttk.Button(bottom, text="Load edits...", command=self._load_edits).pack(
+            side="right", padx=6
+        )
+        ttk.Button(bottom, text="Save edits...", command=self._save_edits).pack(side="right")
+
+        win.bind("<Left>", lambda _e: self._step(-1))
+        win.bind("<Right>", lambda _e: self._step(1))
+
+        self._draw_full()
+        try:  # make the window modal; harmless if the platform refuses
+            win.wait_visibility()
+            win.grab_set()
+        except tk.TclError:
+            pass
+        win.focus_set()
+
+    # ------------------------------------------------------------------ #
+    # Channel list
+    # ------------------------------------------------------------------ #
+
+    def _is_edited(self, channel: str) -> bool:
+        peaks, troughs = self.selection[channel]
+        auto_peaks, auto_troughs = self.auto[channel]
+        return sorted(peaks) != sorted(auto_peaks) or sorted(troughs) != sorted(auto_troughs)
+
+    def _list_text(self, channel: str) -> str:
+        peaks, troughs = self.selection[channel]
+        mark = "  *" if self._is_edited(channel) else ""
+        return f"Ch {channel}    P {len(peaks)}   T {len(troughs)}{mark}"
+
+    def _refresh_list_item(self, channel: str) -> None:
+        i = CHANNELS.index(channel)
+        self.listbox.delete(i)
+        self.listbox.insert(i, self._list_text(channel))
+        if channel == self.channel:
+            self.listbox.selection_set(i)
+
+    def _on_list_select(self, _event=None) -> None:
+        selected = self.listbox.curselection()
+        if selected and CHANNELS[selected[0]] != self.channel:
+            self.channel = CHANNELS[selected[0]]
+            self._draw_full()
+
+    def _step(self, delta: int) -> None:
+        i = min(max(CHANNELS.index(self.channel) + delta, 0), len(CHANNELS) - 1)
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(i)
+        self.listbox.see(i)
+        if CHANNELS[i] != self.channel:
+            self.channel = CHANNELS[i]
+            self._draw_full()
+
+    # ------------------------------------------------------------------ #
+    # Drawing
+    # ------------------------------------------------------------------ #
+
+    def _draw_full(self) -> None:
+        """Redraw the curve, the markers and the actogram for the current channel."""
+        channel = self.channel
+        ax = self.ax
+        ax.clear()
+        self._marker_artists = []  # ax.clear() already discarded the old markers
+        ax.scatter(
+            self.data["Hours"], self.data[channel], s=3.0, c="violet",
+            label="Detrended bioluminescence",
+        )
+        ax.plot(
+            self.smooth["Hours"], self.smooth[channel], "-b", linewidth=1.0,
+            label="9-point moving average",
+        )
+        ax.grid(True, linewidth=0.5, color="lightgray", linestyle="--")
+        ax.set_xlabel("Hours")
+        ax.set_ylabel("Detrended bioluminescence")
+        ax.set_title(f"{self.analysis.settings.experiment_number}   Ch # {channel}")
+        ax.autoscale_view()
+        low, high = ax.get_ylim()
+        pad = (high - low) * 0.10
+        ax.set_ylim(low - pad, high + pad)
+        ax.set_autoscale_on(False)  # keep the view fixed while markers change
+        self.fig.tight_layout()
+        self.toolbar.update()  # forget the previous channel's zoom history
+        self._draw_markers()
+        self._draw_actogram_preview()
+        self.status_var.set(f"Channel {channel}")
+
+    def _draw_markers(self) -> None:
+        for artist in self._marker_artists:
+            try:
+                artist.remove()
+            except (NotImplementedError, ValueError):
+                pass  # already gone (e.g. the axes were cleared)
+        self._marker_artists = []
+        ax = self.ax
+        channel = self.channel
+        peaks, troughs = self.selection[channel]
+        low, high = ax.get_ylim()
+        span = high - low
+        for indices, color, name, sign, va in (
+            (peaks, "red", "Peaks", 1, "bottom"),
+            (troughs, "blue", "Troughs", -1, "top"),
+        ):
+            if not indices:
+                continue
+            hours = self.smooth.loc[indices, "Hours"]
+            values = self.smooth.loc[indices, channel]
+            self._marker_artists.append(
+                ax.scatter(hours, values, marker="o", s=45, color=color, zorder=5, label=name)
+            )
+            for hour, value in zip(hours, values):
+                self._marker_artists.append(
+                    ax.text(
+                        hour, value + sign * span * 0.03, f"{hour:.2f} h",
+                        fontsize=7, color=color, ha="center", va=va, clip_on=True,
+                    )
+                )
+        ax.legend(loc="upper right", fontsize=7, framealpha=0.6)
+
+    def _draw_actogram_preview(self) -> None:
+        settings = self.analysis.settings
+        peaks, troughs = self.selection[self.channel]
+        self.ax_act.clear()
+        _draw_actogram(
+            self.ax_act, self.smooth, peaks, troughs,
+            float(settings.actogram_x_scale), self.analysis.recording.last_hour,
+            settings.label_actogram,
+        )
+        self.ax_act.set_navigate(False)  # zoom/pan applies to the top plot only
+        self.canvas.draw_idle()
+
+    def _after_edit(self, message: str) -> None:
+        self._refresh_list_item(self.channel)
+        self._draw_markers()
+        self._draw_actogram_preview()
+        self.status_var.set(message)
+
+    # ------------------------------------------------------------------ #
+    # Editing
+    # ------------------------------------------------------------------ #
+
+    def _toolbar_active(self) -> bool:
+        mode = getattr(self.toolbar, "mode", "")
+        return bool(getattr(mode, "value", mode))
+
+    def _on_click(self, event) -> None:
+        if event.inaxes is not self.ax or event.button != 1 or event.xdata is None:
+            return
+        if self._toolbar_active():
+            return
+        mode = self.mode_var.get()
+        if mode == "remove":
+            self._remove_nearest(event.x, event.y)
+        else:
+            self._add_at(event.xdata, "peak" if mode == "add_peak" else "trough")
+
+    def _remove_nearest(self, pixel_x: float, pixel_y: float) -> None:
+        channel = self.channel
+        peaks, troughs = self.selection[channel]
+        candidates = [("peak", i) for i in peaks] + [("trough", i) for i in troughs]
+        if not candidates:
+            self.status_var.set("There are no markers in this channel.")
+            return
+        points = np.array(
+            [(self.smooth.loc[i, "Hours"], self.smooth.loc[i, channel]) for _, i in candidates],
+            dtype=float,
+        )
+        pixels = self.ax.transData.transform(points)
+        distances = np.hypot(pixels[:, 0] - pixel_x, pixels[:, 1] - pixel_y)
+        nearest = int(np.argmin(distances))
+        if distances[nearest] > self.HIT_RADIUS_PX:
+            self.status_var.set("No marker near the click.")
+            return
+        kind, index = candidates[nearest]
+        (peaks if kind == "peak" else troughs).remove(index)
+        hour = float(self.smooth.loc[index, "Hours"])
+        self._after_edit(f"Removed {kind} at {hour:.2f} h.")
+
+    def _add_at(self, x: float, kind: str) -> None:
+        channel = self.channel
+        valid = self.smooth.loc[self.smooth[channel].notna(), "Hours"]
+        if valid.empty:
+            self.status_var.set("This channel has no data.")
+            return
+        index = int((valid - x).abs().idxmin())
+        peaks, troughs = self.selection[channel]
+        target, other = (peaks, troughs) if kind == "peak" else (troughs, peaks)
+        hour = float(valid.loc[index])
+        if index in target:
+            self.status_var.set(f"There is already a {kind} at {hour:.2f} h.")
+            return
+        if index in other:
+            self.status_var.set(
+                f"{hour:.2f} h is already marked as the opposite type; remove it first."
+            )
+            return
+        target.append(index)
+        target.sort()
+        self._after_edit(f"Added {kind} at {hour:.2f} h.")
+
+    def _reset_channel(self) -> None:
+        peaks, troughs = self.auto[self.channel]
+        self.selection[self.channel] = (list(peaks), list(troughs))
+        self._after_edit(f"Channel {self.channel} reset to the automatic detection.")
+
+    def _reset_all(self) -> None:
+        if not messagebox.askyesno(
+            APP_TITLE, "Discard all edits in every channel?", parent=self.win
+        ):
+            return
+        self.selection = {ch: (list(p), list(t)) for ch, (p, t) in self.auto.items()}
+        for channel in CHANNELS:
+            self._refresh_list_item(channel)
+        self._draw_markers()
+        self._draw_actogram_preview()
+        self.status_var.set("All channels reset to the automatic detection.")
+
+    # ------------------------------------------------------------------ #
+    # Save / load / finish
+    # ------------------------------------------------------------------ #
+
+    def _save_edits(self) -> None:
+        path = filedialog.asksaveasfilename(
+            parent=self.win,
+            title="Save peak/trough edits",
+            defaultextension=".json",
+            initialfile=f"{self.analysis.input_path.name}_peaks.json",
+            filetypes=[("JSON files", "*.json")],
+        )
+        if not path:
+            return
+        try:
+            save_peaks_json(
+                path, self.selection, self.smooth["Hours"], self.analysis.input_path.name
+            )
+        except OSError as error:
+            messagebox.showerror(APP_TITLE, f"Could not save the file: {error}", parent=self.win)
+            return
+        self.status_var.set(f"Saved: {Path(path).name}")
+
+    def _load_edits(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self.win,
+            title="Load peak/trough edits",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            loaded, skipped = load_peaks_json(path, self.smooth["Hours"])
+        except (OSError, ValueError) as error:
+            messagebox.showerror(APP_TITLE, f"Could not load the file: {error}", parent=self.win)
+            return
+        self.selection.update(loaded)
+        for channel in CHANNELS:
+            self._refresh_list_item(channel)
+        self._draw_markers()
+        self._draw_actogram_preview()
+        note = f" ({skipped} time points did not match this recording and were skipped)" if skipped else ""
+        self.status_var.set(f"Loaded: {Path(path).name}{note}")
+
+    def _close(self) -> None:
+        try:
+            self.win.grab_release()
+        except tk.TclError:
+            pass
+        self.win.destroy()
+
+    def _ok(self) -> None:
+        selection = {ch: (sorted(p), sorted(t)) for ch, (p, t) in self.selection.items()}
+        self._close()
+        self.on_ok(selection)
+
+    def _cancel(self) -> None:
+        self._close()
+        self.on_cancel()
 
 
 def main() -> None:
