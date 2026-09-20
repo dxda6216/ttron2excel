@@ -1338,6 +1338,7 @@ class App:
 
     def _make_variables(self) -> None:
         d = Settings()
+        self._spin_specs: list = []
         self.in_var = tk.StringVar()
         self.out_var = tk.StringVar()
 
@@ -1409,18 +1410,34 @@ class App:
         return combo
 
     def _slider(self, box, row: int, text: str, var, lo, hi, step):
+        """Labelled numeric spinner (name kept from the former slider version)."""
         label = self._label(box, row, text)
-        scale = tk.Scale(
+        is_float = isinstance(step, float)
+        spin = ttk.Spinbox(
             box,
             from_=lo,
             to=hi,
-            resolution=step,
-            orient="horizontal",
-            variable=var,
-            length=230,
+            increment=step,
+            textvariable=var,
+            width=10,
+            justify="right",
+            format="%.1f" if is_float else "%.0f",
         )
-        scale.grid(row=row, column=1, columnspan=2, sticky="ew", pady=2)
-        return label, scale
+        spin.grid(row=row, column=1, columnspan=2, sticky="w", pady=2)
+        self._spin_specs.append((text, var, lo, hi, spin))
+        return label, spin
+
+    def _validate_spinners(self) -> None:
+        """Make sure every spinner holds a number inside its range (raises ValueError)."""
+        for text, var, lo, hi, spin in self._spin_specs:
+            if spin.instate(["disabled"]):
+                continue
+            try:
+                value = float(var.get())
+            except (tk.TclError, ValueError):
+                raise ValueError(f"'{text}' must be a number.") from None
+            if not lo <= value <= hi:
+                raise ValueError(f"'{text}' must be between {lo} and {hi}.")
 
     def _build_files(self, parent) -> None:
         box = self._box(parent, "1. Files")
@@ -1461,7 +1478,7 @@ class App:
         box = self._box(parent, "3. Detrending")
         combo = self._combo(box, 0, "Method", self.method_var, DETRENDING_METHODS)
         combo.bind("<<ComboboxSelected>>", lambda _e: self._on_method_change())
-        # each entry is a (label, scale) pair, enabled/disabled with the method
+        # each entry is a (label, spinner) pair, enabled/disabled with the method
         self._sinc_widgets = [
             self._slider(box, 1, "Sinc cutoff period (hours)", self.cutoff_var, 1, 240, 1),
             self._slider(box, 2, "Sinc filter order (odd)", self.order_var, 1, 361, 2),
@@ -1488,8 +1505,20 @@ class App:
 
     def _build_fit(self, parent) -> None:
         box = self._box(parent, "5. Damped sine fit (time range)")
-        self._slider(box, 0, "Start hour", self.fit_start_var, 0, 360, 1)
-        self._slider(box, 1, "End hour", self.fit_end_var, 0, 360, 1)
+        row = ttk.Frame(box)
+        row.grid(row=0, column=0, columnspan=3, sticky="w")
+        for column, (text, var) in enumerate(
+            (("Start hour", self.fit_start_var), ("End hour", self.fit_end_var))
+        ):
+            ttk.Label(row, text=text).grid(
+                row=0, column=column * 2, sticky="w", padx=(0 if column == 0 else 16, 6), pady=2
+            )
+            spin = ttk.Spinbox(
+                row, from_=0, to=360, increment=1, textvariable=var,
+                width=8, justify="right", format="%.0f",
+            )
+            spin.grid(row=0, column=column * 2 + 1, sticky="w", pady=2)
+            self._spin_specs.append((text, var, 0, 360, spin))
 
     def _build_right(self, parent) -> None:
         parent.columnconfigure(0, weight=1)
@@ -1528,9 +1557,9 @@ class App:
     def _on_method_change(self) -> None:
         sinc = self.method_var.get() == "Sinc Filter"
         for group, enabled in ((self._sinc_widgets, sinc), (self._ma_widgets, not sinc)):
-            for label, scale in group:
+            for label, spin in group:
                 label.state(["!disabled"] if enabled else ["disabled"])
-                scale.configure(state="normal" if enabled else "disabled")
+                spin.state(["!disabled"] if enabled else ["disabled"])
 
     def _browse_input(self) -> None:
         path = filedialog.askopenfilename(
@@ -1574,6 +1603,7 @@ class App:
             dt.datetime.strptime(date_text, "%Y-%m-%d")
         except ValueError:
             raise ValueError("The start date must be in YYYY-MM-DD format.") from None
+        self._validate_spinners()
 
         return Settings(
             experiment_number=experiment,
