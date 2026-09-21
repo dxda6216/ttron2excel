@@ -1,8 +1,5 @@
-numpy
-pandas
-scipy
-matplotlib
-openpyxl
-# GUI は Python 標準の tkinter を使います (追加インストール不要)
-# exe / .app 化する場合のみ:
-# pyinstaller
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+matplotlib>=3.8
+openpyxl>=3.1

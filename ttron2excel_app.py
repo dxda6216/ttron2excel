@@ -40,7 +40,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from matplotlib.backends.backend_pdf import PdfPages  # noqa: E402
 from matplotlib.ticker import FormatStrFormatter, MultipleLocator  # noqa: E402
-from scipy import signal  # noqa: E402
+from scipy import signal, stats  # noqa: E402
 from scipy.optimize import curve_fit  # noqa: E402
 
 APP_TITLE = "Taylortron TRACES \u2192 Excel Converter"
@@ -355,27 +355,249 @@ def selection_differs(selection: PeakSelection, auto: PeakSelection) -> bool:
     )
 
 
+# --------------------------------------------------------------------------- #
+# Period / phase regression on the selected peaks and troughs
+# --------------------------------------------------------------------------- #
+
+REGRESSION_MIN_POINTS = 3          # a line through 2 points has no error estimate
+ACTOGRAM_MIN_PERIOD_HOURS = 12.0   # range of the adjustable actogram period
+ACTOGRAM_MAX_PERIOD_HOURS = 60.0
+
+REGRESSION_COLUMNS = [
+    "Channel",
+    "Type",
+    "N Points",
+    "Actogram Period (Hours)",
+    "Period (Hours)",
+    "Period SE (Hours)",
+    "R squared",
+    "Phase (Hours)",
+    "Phase (radians)",
+    "Fitted Time at Cycle 0 (Hours)",
+]
+REGRESSION_POINT_COLUMNS = [
+    "Channel",
+    "Type",
+    "Cycle",
+    "Time (Hours)",
+    "Fitted Time (Hours)",
+    "Residual (Hours)",
+]
+
+RegSelection = dict  # channel -> (list of selected peak rows, list of selected trough rows)
+
+
+def resolve_periods(actogram_period, default: float = HOURS_PER_DAY) -> dict:
+    """Actogram period of every channel from a float, a {channel: float} dict or None."""
+    if isinstance(actogram_period, dict):
+        return {ch: float(actogram_period.get(ch) or default) for ch in CHANNELS}
+    value = float(actogram_period) if actogram_period else float(default)
+    return {ch: value for ch in CHANNELS}
+
+
+def default_reg_selection(selection: PeakSelection) -> RegSelection:
+    """By default every peak/trough takes part in the regression."""
+    return {ch: (list(p), list(t)) for ch, (p, t) in selection.items()}
+
+
+def used_selection(selection_entry, reg_entry) -> tuple[list[int], list[int]]:
+    """Selected-for-regression rows that are still peaks/troughs, sorted."""
+    peaks, troughs = selection_entry
+    reg_peaks, reg_troughs = reg_entry
+    return (
+        sorted(i for i in peaks if i in set(reg_peaks)),
+        sorted(i for i in troughs if i in set(reg_troughs)),
+    )
+
+
+def assign_cycle_numbers(times: np.ndarray, period_guess: float) -> np.ndarray:
+    """Number the (sorted) event times 0, 1, 2 ... allowing skipped cycles.
+
+    The gap between two consecutive selected events is rounded to a whole
+    number of cycles; the period used for rounding is refined iteratively
+    from the gaps themselves, starting at `period_guess`.
+    """
+    gaps = np.diff(times)
+    period = float(period_guess)
+    for _ in range(50):
+        steps = np.maximum(1.0, np.rint(gaps / period))
+        new_period = float(gaps.sum() / steps.sum())
+        if abs(new_period - period) < 1e-9:
+            break
+        period = new_period
+    steps = np.maximum(1.0, np.rint(gaps / period))
+    return np.concatenate(([0.0], np.cumsum(steps)))
+
+
+def regress_period_phase(times, period_guess: float) -> dict | None:
+    """Linear regression  time = intercept + period * cycle_number.
+
+    Returns None with fewer than REGRESSION_MIN_POINTS events.  The phase is
+    the fitted event time taken modulo the period, counted from Hours = 0.
+    """
+    t = np.sort(np.asarray(times, dtype=float))
+    if len(t) < REGRESSION_MIN_POINTS:
+        return None
+    cycles = assign_cycle_numbers(t, period_guess)
+    fit = stats.linregress(cycles, t)
+    period = float(fit.slope)
+    intercept = float(fit.intercept)
+    phase_hours = intercept % period
+    return {
+        "n": len(t),
+        "period": period,
+        "period_se": float(fit.stderr),
+        "r2": float(fit.rvalue) ** 2,
+        "intercept": intercept,
+        "phase_h": phase_hours,
+        "phase_rad": 2.0 * math.pi * phase_hours / period,
+        "cycles": cycles,
+        "times": t,
+        "fitted": intercept + period * cycles,
+    }
+
+
+def channel_regressions(smoothed: pd.DataFrame, peaks, troughs, period_guess: float) -> dict:
+    """{'Peak': result or None, 'Trough': result or None} for one channel."""
+    out = {}
+    for kind, indices in (("Peak", peaks), ("Trough", troughs)):
+        times = smoothed.loc[list(indices), "Hours"].to_numpy() if len(indices) else []
+        out[kind] = regress_period_phase(times, period_guess)
+    return out
+
+
+def compute_all_regressions(
+    smoothed: pd.DataFrame,
+    selection: PeakSelection,
+    reg_selection: RegSelection,
+    period_guess,
+) -> dict:
+    """channel -> {'Peak': ..., 'Trough': ..., 'used': (peak rows, trough rows)}."""
+    result = {}
+    guesses = resolve_periods(period_guess)  # a float or one value per channel
+    for channel in CHANNELS:
+        used = used_selection(selection[channel], reg_selection.get(channel, selection[channel]))
+        entry = channel_regressions(smoothed, used[0], used[1], guesses[channel])
+        entry["used"] = used
+        result[channel] = entry
+    return result
+
+
+def regression_summary_text(regression: dict | None, n_peaks: int, n_troughs: int) -> str:
+    """Two-line human-readable result (used in the review window and the PDF)."""
+    lines = []
+    for kind, name, n in (("Peak", "Peaks", n_peaks), ("Trough", "Troughs", n_troughs)):
+        result = regression.get(kind) if regression else None
+        if result is None:
+            lines.append(
+                f"{name} (n={n}): at least {REGRESSION_MIN_POINTS} selected points "
+                "are needed for the regression"
+            )
+            continue
+        se = result["period_se"]
+        se_text = f" \u00b1 {se:.2f} (SE)" if np.isfinite(se) else ""
+        lines.append(
+            f"{name} (n={n}): period = {result['period']:.2f}{se_text} h,  "
+            f"phase = {result['phase_h']:.2f} h ({result['phase_rad']:.2f} rad),  "
+            f"R\u00b2 = {result['r2']:.3f}"
+        )
+    return "\n".join(lines)
+
+
+def regression_tables(
+    smoothed: pd.DataFrame, regressions: dict, periods=None
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(one row per channel and type, one row per point used) for Excel."""
+    periods = resolve_periods(periods)
+    summary_rows, point_rows = [], []
+    for channel in CHANNELS:
+        entry = regressions[channel]
+        used_peaks, used_troughs = entry["used"]
+        for kind, used in (("Peak", used_peaks), ("Trough", used_troughs)):
+            result = entry[kind]
+            row = {
+                "Channel": channel,
+                "Type": kind,
+                "N Points": len(used),
+                "Actogram Period (Hours)": periods[channel],
+            }
+            if result is None:
+                row.update({c: np.nan for c in REGRESSION_COLUMNS[4:]})
+            else:
+                row.update(
+                    {
+                        "Period (Hours)": result["period"],
+                        "Period SE (Hours)": result["period_se"],
+                        "R squared": result["r2"],
+                        "Phase (Hours)": result["phase_h"],
+                        "Phase (radians)": result["phase_rad"],
+                        "Fitted Time at Cycle 0 (Hours)": result["intercept"],
+                    }
+                )
+                for cycle, time, fitted in zip(
+                    result["cycles"], result["times"], result["fitted"]
+                ):
+                    point_rows.append(
+                        {
+                            "Channel": channel,
+                            "Type": kind,
+                            "Cycle": int(cycle),
+                            "Time (Hours)": float(time),
+                            "Fitted Time (Hours)": float(fitted),
+                            "Residual (Hours)": float(time - fitted),
+                        }
+                    )
+            summary_rows.append(row)
+    return (
+        pd.DataFrame(summary_rows, columns=REGRESSION_COLUMNS),
+        pd.DataFrame(point_rows, columns=REGRESSION_POINT_COLUMNS),
+    )
+
+
 PEAKS_JSON_FORMAT = "ttron-peaks-v1"
 
 
-def save_peaks_json(path, selection: PeakSelection, hours: pd.Series, traces_file: str) -> None:
-    """Save the peak/trough selection (by time, so it survives re-processing)."""
+def save_peaks_json(
+    path,
+    selection: PeakSelection,
+    hours: pd.Series,
+    traces_file: str,
+    reg_selection: RegSelection | None = None,
+    actogram_period=None,
+) -> None:
+    """Save the peak/trough selection (by time, so it survives re-processing).
+
+    The regression selection and the per-channel actogram period are optional
+    extras; older files without them still load.
+    """
+    periods = resolve_periods(actogram_period) if actogram_period is not None else None
+    channels = {}
+    for channel, (peaks, troughs) in selection.items():
+        entry = {
+            "peaks": [float(hours.loc[i]) for i in peaks],
+            "troughs": [float(hours.loc[i]) for i in troughs],
+        }
+        if reg_selection is not None and channel in reg_selection:
+            reg_peaks, reg_troughs = reg_selection[channel]
+            entry["regression_peaks"] = [float(hours.loc[i]) for i in sorted(reg_peaks)]
+            entry["regression_troughs"] = [float(hours.loc[i]) for i in sorted(reg_troughs)]
+        if periods is not None:
+            entry["actogram_period"] = periods[channel]
+        channels[channel] = entry
     payload = {
         "format": PEAKS_JSON_FORMAT,
         "traces_file": traces_file,
-        "channels": {
-            channel: {
-                "peaks": [float(hours.loc[i]) for i in peaks],
-                "troughs": [float(hours.loc[i]) for i in troughs],
-            }
-            for channel, (peaks, troughs) in selection.items()
-        },
+        "channels": channels,
     }
     Path(path).write_text(json.dumps(payload, indent=1), encoding="utf-8")
 
 
-def load_peaks_json(path, hours: pd.Series) -> tuple[PeakSelection, int]:
-    """Load a saved selection. Returns (selection, number of times not matched)."""
+def load_peaks_json(path, hours: pd.Series):
+    """Load a saved selection.
+
+    Returns (selection, number of times not matched, regression selection or
+    None, {channel: actogram period} or None).
+    """
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("format") != PEAKS_JSON_FORMAT:
         raise ValueError("This is not a peaks/troughs file saved by this application.")
@@ -393,16 +615,43 @@ def load_peaks_json(path, hours: pd.Series) -> tuple[PeakSelection, int]:
                 skipped += 1
         return sorted(rows)
 
-    result = {}
+    result, regression = {}, {}
+    for channel, entry in payload.get("channels", {}).items():
+        if channel not in CHANNELS:
+            continue
+        result[channel] = (to_rows(entry.get("peaks", [])), to_rows(entry.get("troughs", [])))
+        if "regression_peaks" in entry or "regression_troughs" in entry:
+            regression[channel] = (
+                to_rows(entry.get("regression_peaks", [])),
+                to_rows(entry.get("regression_troughs", [])),
+            )
+
+    def valid_period(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        ok = ACTOGRAM_MIN_PERIOD_HOURS <= value <= ACTOGRAM_MAX_PERIOD_HOURS
+        return value if ok else None
+
+    legacy = valid_period(payload.get("actogram_period"))  # older files: one value
+    periods = {}
     for channel, entry in payload.get("channels", {}).items():
         if channel in CHANNELS:
-            result[channel] = (to_rows(entry.get("peaks", [])), to_rows(entry.get("troughs", [])))
-    return result, skipped
+            value = valid_period(entry.get("actogram_period")) or legacy
+            if value:
+                periods[channel] = value
+    if legacy:
+        periods = {ch: periods.get(ch, legacy) for ch in CHANNELS}
+    return result, skipped, (regression or None), (periods or None)
 
 
 # --------------------------------------------------------------------------- #
 # Excel / .dat / zip output
 # --------------------------------------------------------------------------- #
+
+REGRESSION_SHEET = "Period-Phase Regression"
+
 
 def build_note_sheet(rows: list[tuple[str, object]]) -> pd.DataFrame:
     """Labels in column A, values in column E (as in the original workbook)."""
@@ -427,9 +676,13 @@ def write_main_workbook(
     detrended: pd.DataFrame,
     detrended_smoothed: dict[int, pd.DataFrame],
     peaks_troughs: pd.DataFrame,
+    regression: pd.DataFrame | None = None,
+    regression_points: pd.DataFrame | None = None,
 ) -> None:
     with pd.ExcelWriter(path) as writer:
         note.to_excel(writer, sheet_name="Note", index=False, header=False)
+        if regression is not None:  # second sheet, so it is easy to find
+            regression.to_excel(writer, sheet_name=REGRESSION_SHEET, index=False)
         raw.to_excel(writer, sheet_name="Raw Data")
         for window, frame in smoothed.items():
             frame.to_excel(
@@ -460,6 +713,9 @@ def write_main_workbook(
             print("No peaks or troughs detected for any channel.")
         else:
             peaks_troughs.to_excel(writer, sheet_name="Peaks and Troughs", index=False)
+
+        if regression_points is not None and not regression_points.empty:
+            regression_points.to_excel(writer, sheet_name="Regression Points", index=False)
 
 
 def write_raw_only_workbook(path: str, raw: pd.DataFrame, time_interval: float) -> None:
@@ -594,6 +850,42 @@ def plot_overview_grid(
         plt.close(figure)
 
 
+def actogram_points(smoothed: pd.DataFrame, indices, day_length: float) -> list:
+    """(x, row, hour, row label) of every drawn copy of each event.
+
+    The plot is double-plotted: an event on day d (d > 0) is drawn once at
+    (time of day, d) and once at (time of day + T, d - 1).
+    """
+    points = []
+    if len(indices) == 0:
+        return points
+    hours = smoothed.loc[list(indices), "Hours"]
+    for index, hour in zip(hours.index, hours.to_numpy()):
+        day = hour // day_length
+        time_in_day = hour - day * day_length
+        points.append((time_in_day, day, hour, int(index)))
+        if day > 0:  # second copy of the day, shifted one cycle right
+            points.append((time_in_day + day_length, day - 1, hour, int(index)))
+    return points
+
+
+def _regression_line(result: dict, day_length: float):
+    """The fitted event times as a continuous line on the double-plotted actogram."""
+    cycles = np.arange(0, int(result["cycles"].max()) + 1)
+    times = result["intercept"] + result["period"] * cycles
+    day = np.floor(times / day_length)
+    x = times - day * day_length
+    row = day.copy()
+    for i in range(1, len(x)):  # (x + T, row - 1) is the same moment as (x, row)
+        while x[i] - x[i - 1] > day_length / 2:
+            x[i] -= day_length
+            row[i] += 1
+        while x[i] - x[i - 1] < -day_length / 2:
+            x[i] += day_length
+            row[i] -= 1
+    return x, row
+
+
 def _draw_actogram(
     ax,
     smoothed: pd.DataFrame,
@@ -602,31 +894,59 @@ def _draw_actogram(
     day_length: float,
     last_hour: float,
     show_labels: bool,
+    selected=None,
+    regression: dict | None = None,
+    summary: str = "",
 ) -> None:
-    """Double-plotted actogram of peak and trough times."""
+    """Double-plotted actogram of peak and trough times.
 
-    def to_actogram_points(indices):
-        points = []
-        for hour in smoothed.loc[indices, "Hours"].to_numpy():
-            day = hour // day_length
-            time_in_day = hour - day * day_length
-            points.append((time_in_day, day, hour))
-            if day > 0:  # second copy of the day, shifted one cycle right
-                points.append((time_in_day + day_length, day - 1, hour))
-        return points
+    `selected` = (peak rows, trough rows) taking part in the regression: they
+    get a black ring.  `regression` (see channel_regressions) adds the fitted
+    lines; `summary` is printed under the plot.
+    """
+    selected_sets = (
+        (set(selected[0]), set(selected[1])) if selected is not None else None
+    )
+    ring_labelled = False
 
-    for indices, color, label in (
-        (peaks, "red", "Peaks"),
-        (troughs, "blue", "Troughs"),
+    for kind_number, (indices, color, dark, label) in enumerate(
+        (
+            (peaks, "red", "darkred", "Peaks"),
+            (troughs, "blue", "navy", "Troughs"),
+        )
     ):
-        points = to_actogram_points(indices)
+        points = actogram_points(smoothed, indices, day_length)
         if not points:
             continue
-        xs, ys, original_hours = zip(*points)
-        ax.scatter(xs, ys, marker="o", s=20, color=color, label=label)
+        xs, ys, original_hours, rows = zip(*points)
+        ax.scatter(xs, ys, marker="o", s=20, color=color, label=label, zorder=3)
         if show_labels:
             for x, y, hour in zip(xs, ys, original_hours):
                 ax.text(x + 0.5, y, f"{hour:.2f}", fontsize=5, color=color)
+
+        if selected_sets is not None:
+            ringed = [
+                (x, y) for x, y, _h, row in points if row in selected_sets[kind_number]
+            ]
+            if ringed:
+                rx, ry = zip(*ringed)
+                ax.scatter(
+                    rx, ry, marker="o", s=85, facecolors="none", edgecolors="black",
+                    linewidths=1.1, zorder=4,
+                    label=None if ring_labelled else "Used in regression",
+                )
+                ring_labelled = True
+
+        result = regression.get("Peak" if kind_number == 0 else "Trough") if regression else None
+        if result is not None:
+            line_x, line_row = _regression_line(result, day_length)
+            for k, shift in enumerate((0, 1, -1)):
+                ax.plot(
+                    line_x + shift * day_length, line_row - shift,
+                    linestyle="--", linewidth=1.0, color=dark, alpha=0.9, zorder=2,
+                    label=(f"{label[:-1]} regression (T = {result['period']:.2f} h)"
+                           if k == 0 else None),
+                )
 
     if show_labels:  # leave room for the text labels
         ax.set_xlim(-0.085 * day_length, 2.085 * day_length)
@@ -662,8 +982,18 @@ def _draw_actogram(
     ax.set_xlabel("Time (Hours)", fontsize=10)
     ax.grid(True, linestyle="--", alpha=0.7)
     if ax.get_legend_handles_labels()[0]:  # nothing detected on a flat channel
-        ax.legend(loc="upper right", fontsize=6)
+        if selected is not None or regression:
+            # several entries: keep the legend off the data
+            ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=6, borderaxespad=0)
+        else:
+            ax.legend(loc="upper right", fontsize=6)
     ax.invert_yaxis()  # day 0 at the top
+    if summary:
+        ax.text(
+            0.5, -0.27, summary, transform=ax.transAxes, ha="center", va="top",
+            fontsize=9, linespacing=1.5,
+            bbox={"boxstyle": "round,pad=0.4", "facecolor": "#f4f4f4", "edgecolor": "gray"},
+        )
 
 
 def plot_channel_page(
@@ -682,6 +1012,8 @@ def plot_channel_page(
     label_peaks: bool,
     label_actogram: bool,
     peaks_troughs: tuple | None = None,
+    reg_selection: tuple | None = None,
+    regression: dict | None = None,
 ) -> None:
     """One page per channel: raw + trend, detrended + peaks, actogram."""
     with plt.rc_context(CHANNEL_PAGE_RC):
@@ -748,9 +1080,15 @@ def plot_channel_page(
 
         # --- actogram ------------------------------------------------------- #
         ax_actogram = figure.add_subplot(3, 1, 3)
+        summary = ""
+        if regression is not None and reg_selection is not None:
+            summary = regression_summary_text(
+                regression, len(reg_selection[0]), len(reg_selection[1])
+            )
         _draw_actogram(
             ax_actogram, detrended_smoothed, peaks, troughs,
             day_length, last_hour, label_actogram,
+            selected=reg_selection, regression=regression, summary=summary,
         )
 
         figure.tight_layout(rect=(0, 0.02, 1, 0.98))
@@ -1105,10 +1443,16 @@ def write_outputs(
     output_dir,
     peaks: PeakSelection | None = None,
     progress=None,
+    reg_selection: RegSelection | None = None,
+    actogram_period=None,
 ) -> list[Path]:
     """Write the Excel files, ZIP and PDF. Returns the list of files written.
 
     `peaks` is the peak/trough selection to use (default: automatic detection).
+    `reg_selection` says which of them take part in the period/phase regression
+    (default: all) and `actogram_period` is the actogram's x-axis period in hours:
+    one number for every channel or a {channel: hours} dict (default: the value in
+    the settings, 24 h).
     """
     report = _reporter(progress)
     s = analysis.settings
@@ -1124,6 +1468,8 @@ def write_outputs(
     if peaks is None:
         peaks = analysis.auto_peaks
     edited = selection_differs(peaks, analysis.auto_peaks)
+    if reg_selection is None:
+        reg_selection = default_reg_selection(peaks)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1137,7 +1483,17 @@ def write_outputs(
     channel_order = (
         CHANNELS if s.data_plotting.endswith("first") else CHANNELS[1:] + CHANNELS[:1]
     )
-    day_length = float(s.actogram_x_scale)
+    periods = resolve_periods(actogram_period, float(s.actogram_x_scale or HOURS_PER_DAY))
+    regressions = compute_all_regressions(detrended_9pma, peaks, reg_selection, periods)
+    regression_summary, regression_points = regression_tables(
+        detrended_9pma, regressions, periods
+    )
+    distinct_periods = sorted(set(periods.values()))
+    periods_note = (
+        distinct_periods[0]
+        if len(distinct_periods) == 1
+        else f"Set per channel (see the '{REGRESSION_SHEET}' sheet)"
+    )
 
     start_hour, end_hour = s.fit_start_hour, s.fit_end_hour
     if end_hour - start_hour <= 23:  # too short to see a full cycle; fall back
@@ -1163,6 +1519,15 @@ def write_outputs(
             ("Detrending Method", s.detrending_method),
             ("Trend Line Parameter", trend.summary),
             ("Peaks and Troughs", "Edited manually" if edited else "Automatic detection"),
+            ("Actogram Period (Hours)", periods_note),
+            (
+                "Period/Phase Regression",
+                "Linear regression of selected peak/trough times against cycle number",
+            ),
+            (
+                "Regression Phase (Hours)",
+                "Fitted peak/trough time modulo the period, counted from Hours = 0",
+            ),
             ("", ""),
             ("Data Processed Date and Time (UTC)", utc_now_string()),
         ]
@@ -1179,6 +1544,8 @@ def write_outputs(
         peaks_troughs=peaks_and_troughs_table(
             detrended_9pma, time_interval, selection=peaks, auto=analysis.auto_peaks
         ),
+        regression=regression_summary,
+        regression_points=regression_points,
     )
     print(f"Excel file: {main_workbook.name}  has been generated.")
     report(0.20, "Writing Excel files...")
@@ -1241,11 +1608,13 @@ def write_outputs(
                 detrended_smoothed=detrended_9pma,
                 axis=axis,
                 time_interval=time_interval,
-                day_length=day_length,
+                day_length=periods[channel],
                 last_hour=recording.last_hour,
                 label_peaks=s.label_detrended_plot,
                 label_actogram=s.label_actogram,
                 peaks_troughs=peaks[channel],
+                reg_selection=regressions[channel]["used"],
+                regression=regressions[channel],
             )
 
         print("\nPerforming damped sine curve fitting...")
@@ -1270,6 +1639,7 @@ def write_outputs(
 
     with pd.ExcelWriter(str(fit_workbook)) as writer:
         fit_results.to_excel(writer, sheet_name="Damped Sine Fit", index=False)
+        regression_summary.to_excel(writer, sheet_name=REGRESSION_SHEET, index=False)
     print(f"\nDamped sine fitting results written to: {fit_workbook.name}")
 
     outputs = [main_workbook, raw_workbook, fit_workbook, zip_archive, plot_pdf]
@@ -1281,11 +1651,17 @@ def write_outputs(
 
 
 def run_analysis(
-    input_path, output_dir, settings: Settings, progress=None, peaks: PeakSelection | None = None
+    input_path,
+    output_dir,
+    settings: Settings,
+    progress=None,
+    peaks: PeakSelection | None = None,
+    reg_selection: RegSelection | None = None,
+    actogram_period: float | None = None,
 ) -> list[Path]:
     """analyze() + write_outputs() in one call (no review step)."""
     analysis = analyze(input_path, settings, progress)
-    return write_outputs(analysis, output_dir, peaks, progress)
+    return write_outputs(analysis, output_dir, peaks, progress, reg_selection, actogram_period)
 
 
 # =========================================================================== #
@@ -1501,7 +1877,7 @@ class App:
         ttk.Checkbutton(
             box, text="Label peaks/troughs in actogram", variable=self.label_act_var
         ).grid(row=5, column=0, columnspan=3, sticky="w")
-        self._slider(box, 6, "Actogram x-axis scale (hours)", self.acto_var, 12, 60, 0.1)
+        self._slider(box, 6, "Actogram period (h, default)", self.acto_var, 12, 60, 0.1)
 
     def _build_fit(self, parent) -> None:
         box = self._box(parent, "5. Damped sine fit (time range)")
@@ -1697,13 +2073,16 @@ class App:
         except Exception as error:  # noqa: BLE001 - shown to the user
             self.queue.put(("error", traceback.format_exc(), str(error)))
 
-    def _export_worker(self, analysis: Analysis, out_dir: str, peaks) -> None:
+    def _export_worker(
+        self, analysis: Analysis, out_dir: str, peaks, reg_selection, actogram_period
+    ) -> None:
         """Background thread, step 2: write Excel / ZIP / PDF files."""
         writer = _QueueWriter(self.queue)
         try:
             with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
                 outputs = write_outputs(
-                    analysis, out_dir, peaks, progress=self._progress_callback()
+                    analysis, out_dir, peaks, progress=self._progress_callback(),
+                    reg_selection=reg_selection, actogram_period=actogram_period,
                 )
             self.queue.put(("done", outputs))
         except Exception as error:  # noqa: BLE001 - shown to the user
@@ -1717,12 +2096,19 @@ class App:
                 self.root, analysis, on_ok=self._start_export, on_cancel=self._on_review_cancel
             )
         else:
-            self._start_export(analysis.auto_peaks)
+            self._start_export(
+                analysis.auto_peaks,
+                default_reg_selection(analysis.auto_peaks),
+                float(analysis.settings.actogram_x_scale),
+            )
 
-    def _start_export(self, peaks) -> None:
+    def _start_export(self, peaks, reg_selection, actogram_period) -> None:
         self.progress["value"] = 0
         self.status_var.set("Writing output files...")
-        self._run_in_thread(self._export_worker, self.analysis, self.pending_out_dir, peaks)
+        self._run_in_thread(
+            self._export_worker, self.analysis, self.pending_out_dir,
+            peaks, reg_selection, actogram_period,
+        )
 
     def _on_review_cancel(self) -> None:
         self.run_button.configure(state="normal")
@@ -1785,16 +2171,24 @@ class App:
 
 
 class ReviewWindow:
-    """Modal window for checking and hand-editing the detected peaks/troughs."""
+    """Modal window for checking and hand-editing the detected peaks/troughs.
 
-    HIT_RADIUS_PX = 25  # how close (in pixels) a click must be to grab a marker
+    Top plot    : detrended data; add / remove peaks and troughs.
+    Bottom plot : actogram with an adjustable period; peaks/troughs picked with
+                  the mouse are used for the period/phase regression.
+    """
+
+    HIT_RADIUS_PX = 25     # how close (in pixels) a click must be to grab a marker
+    DRAG_THRESHOLD_PX = 6  # movement below this counts as a click, not a drag
 
     HELP = (
-        "Remove: choose 'Remove' and click a marker.   "
-        "Add: choose 'Add peak' or 'Add trough' and click near the curve "
-        "(snaps to the nearest sample point).   "
-        "While a zoom/pan tool of the toolbar is active, clicks do not edit anything.   "
-        "Switch channels with the list or the Left/Right keys."
+        "Top plot: choose 'Remove' and click a marker to delete it; choose 'Add peak' / "
+        "'Add trough' and click near the curve to add one (snaps to the nearest sample).   "
+        "Actogram: click a point to use / not use it in the period-phase regression "
+        "(ringed points are used); drag a box to select all points inside, right-drag to "
+        "deselect them.   The actogram period (default 24 h) is set separately for each "
+        "channel and is used for that channel's page in the PDF.   While a zoom/pan tool of the toolbar is active, clicks do not edit "
+        "anything.   Switch channels with the list or the Left/Right keys."
     )
 
     def __init__(self, parent, analysis: Analysis, on_ok, on_cancel) -> None:
@@ -1808,13 +2202,21 @@ class ReviewWindow:
         self.smooth = analysis.detrended_9pma
         self.auto = analysis.auto_peaks
         self.selection = {ch: (list(p), list(t)) for ch, (p, t) in self.auto.items()}
+        # peaks/troughs that take part in the regression (by default: all of them)
+        self.reg_sel = self._all_selected()
+        # actogram period of every channel (default 24 h); see the day_length property
+        default_period = self._clamp_period(float(analysis.settings.actogram_x_scale))
+        self.periods = {ch: default_period for ch in CHANNELS}
         self.channel = CHANNELS[0]
         self._marker_artists: list = []
+        self._drag: dict | None = None
+        self._drag_patch = None
+        self._closed = False
 
         win = self.win = tk.Toplevel(parent)
         win.title("Review peaks and troughs")
-        _fit_geometry(win, 1200, 980)
-        win.minsize(900, 620)
+        _fit_geometry(win, 1200, 1020)
+        win.minsize(900, 660)
         win.transient(parent)
         win.protocol("WM_DELETE_WINDOW", self._cancel)
         win.columnconfigure(1, weight=1)
@@ -1822,6 +2224,8 @@ class ReviewWindow:
 
         self.mode_var = tk.StringVar(value="remove")
         self.status_var = tk.StringVar(value="")
+        self.period_var = tk.StringVar(value=f"{self.day_length:g}")
+        self.reg_var = tk.StringVar(value="")
 
         ttk.Label(win, text=self.HELP, wraplength=1120, padding=(10, 8)).grid(
             row=0, column=0, columnspan=2, sticky="ew"
@@ -1846,8 +2250,10 @@ class ReviewWindow:
         # --- plot area ------------------------------------------------------- #
         centre = ttk.Frame(win, padding=(4, 0, 10, 0))
         centre.grid(row=1, column=1, sticky="nsew")
+
         controls = ttk.Frame(centre)
         controls.pack(fill="x", pady=(0, 4))
+        ttk.Label(controls, text="Top plot:").pack(side="left", padx=(0, 6))
         for text, value in (
             ("Remove", "remove"),
             ("Add peak", "add_peak"),
@@ -1864,14 +2270,47 @@ class ReviewWindow:
             side="right", padx=(0, 12)
         )
 
+        acto = ttk.Frame(centre)
+        acto.pack(fill="x", pady=(0, 4))
+        ttk.Label(acto, text="Actogram period (h), this channel:").pack(side="left", padx=(0, 4))
+        self.period_spin = ttk.Spinbox(
+            acto, from_=ACTOGRAM_MIN_PERIOD_HOURS, to=ACTOGRAM_MAX_PERIOD_HOURS,
+            increment=0.1, textvariable=self.period_var, width=7, justify="right",
+            format="%.1f", command=self._apply_period,
+        )
+        self.period_spin.pack(side="left")
+        self.period_spin.bind("<Return>", self._apply_period)
+        self.period_spin.bind("<FocusOut>", self._apply_period)
+        ttk.Button(acto, text="24 h", width=5, command=lambda: self._set_period(24.0)).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(acto, text="Apply to all channels", command=self._period_to_all).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Separator(acto, orient="vertical").pack(side="left", fill="y", padx=12)
+        ttk.Label(acto, text="Regression points:").pack(side="left", padx=(0, 6))
+        ttk.Button(acto, text="Select all", command=lambda: self._select_all(True)).pack(
+            side="left"
+        )
+        ttk.Button(acto, text="Clear", command=lambda: self._select_all(False)).pack(
+            side="left", padx=(4, 0)
+        )
+
         self.fig = Figure(figsize=(8, 7.2), dpi=100)
-        self.ax = self.fig.add_subplot(2, 1, 1)
-        self.ax_act = self.fig.add_subplot(2, 1, 2)
+        grid = self.fig.add_gridspec(2, 1, height_ratios=[1.0, 1.15])
+        self.ax = self.fig.add_subplot(grid[0])
+        self.ax_act = self.fig.add_subplot(grid[1])
         self.canvas = FigureCanvasTkAgg(self.fig, master=centre)
         self.toolbar = NavigationToolbar2Tk(self.canvas, centre, pack_toolbar=False)
         self.toolbar.pack(side="bottom", fill="x")
+        ttk.Label(centre, textvariable=self.reg_var, justify="left", padding=(2, 4)).pack(
+            side="bottom", fill="x"
+        )
         self.canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
         self.canvas.mpl_connect("button_press_event", self._on_click)
+        self.canvas.mpl_connect("button_press_event", self._on_act_press)
+        self.canvas.mpl_connect("motion_notify_event", self._on_act_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_act_release)
 
         # --- bottom bar ------------------------------------------------------ #
         bottom = ttk.Frame(win, padding=10)
@@ -1885,8 +2324,8 @@ class ReviewWindow:
         )
         ttk.Button(bottom, text="Save edits...", command=self._save_edits).pack(side="right")
 
-        win.bind("<Left>", lambda _e: self._step(-1))
-        win.bind("<Right>", lambda _e: self._step(1))
+        win.bind("<Left>", lambda _e: self._key_step(-1))
+        win.bind("<Right>", lambda _e: self._key_step(1))
 
         self._draw_full()
         try:  # make the window modal; harmless if the platform refuses
@@ -1895,6 +2334,36 @@ class ReviewWindow:
         except tk.TclError:
             pass
         win.focus_set()
+
+    # ------------------------------------------------------------------ #
+    # Helpers
+    # ------------------------------------------------------------------ #
+
+    @property
+    def day_length(self) -> float:
+        """Actogram period of the channel being shown."""
+        return self.periods[self.channel]
+
+    @day_length.setter
+    def day_length(self, value: float) -> None:
+        self.periods[self.channel] = value
+
+    def _all_selected(self) -> dict:
+        return {ch: (set(p), set(t)) for ch, (p, t) in self.selection.items()}
+
+    @staticmethod
+    def _clamp_period(value: float) -> float:
+        return min(max(round(value, 2), ACTOGRAM_MIN_PERIOD_HOURS), ACTOGRAM_MAX_PERIOD_HOURS)
+
+    def _used(self, channel: str | None = None) -> tuple[list[int], list[int]]:
+        """Peaks/troughs of a channel that are selected for the regression."""
+        channel = channel or self.channel
+        peaks, troughs = self.selection[channel]
+        sel_peaks, sel_troughs = self.reg_sel[channel]
+        return (
+            [i for i in peaks if i in sel_peaks],
+            [i for i in troughs if i in sel_troughs],
+        )
 
     # ------------------------------------------------------------------ #
     # Channel list
@@ -1920,10 +2389,18 @@ class ReviewWindow:
     def _on_list_select(self, _event=None) -> None:
         selected = self.listbox.curselection()
         if selected and CHANNELS[selected[0]] != self.channel:
+            self._apply_period()  # commit a typed value to the channel being left
             self.channel = CHANNELS[selected[0]]
             self._draw_full()
 
+    def _key_step(self, delta: int) -> None:
+        # Left/Right must keep moving the cursor while the period box is being edited.
+        if self.win.focus_get() is self.period_spin:
+            return
+        self._step(delta)
+
     def _step(self, delta: int) -> None:
+        self._apply_period()
         i = min(max(CHANNELS.index(self.channel) + delta, 0), len(CHANNELS) - 1)
         self.listbox.selection_clear(0, "end")
         self.listbox.selection_set(i)
@@ -1958,7 +2435,14 @@ class ReviewWindow:
         low, high = ax.get_ylim()
         pad = (high - low) * 0.10
         ax.set_ylim(low - pad, high + pad)
+        # x axis: major ticks every 24 h, counted from 0
+        hours = self.data["Hours"].dropna()
+        x_min = min(0.0, math.floor(float(hours.min()) / HOURS_PER_DAY) * HOURS_PER_DAY)
+        x_max = math.ceil(float(hours.max()) / HOURS_PER_DAY) * HOURS_PER_DAY
+        ax.set_xlim(x_min, x_max)
+        ax.xaxis.set_major_locator(MultipleLocator(HOURS_PER_DAY))
         ax.set_autoscale_on(False)  # keep the view fixed while markers change
+        self.period_var.set(f"{self.day_length:g}")  # each channel has its own period
         self.fig.tight_layout()
         self.toolbar.update()  # forget the previous channel's zoom history
         self._draw_markers()
@@ -2000,13 +2484,19 @@ class ReviewWindow:
     def _draw_actogram_preview(self) -> None:
         settings = self.analysis.settings
         peaks, troughs = self.selection[self.channel]
+        used = self._used()
+        regression = channel_regressions(self.smooth, used[0], used[1], self.day_length)
+        self._drag_patch = None  # ax.clear() below discards it
         self.ax_act.clear()
         _draw_actogram(
             self.ax_act, self.smooth, peaks, troughs,
-            float(settings.actogram_x_scale), self.analysis.recording.last_hour,
+            self.day_length, self.analysis.recording.last_hour,
             settings.label_actogram,
+            selected=used, regression=regression,
         )
         self.ax_act.set_navigate(False)  # zoom/pan applies to the top plot only
+        self.reg_var.set(regression_summary_text(regression, len(used[0]), len(used[1])))
+        self.fig.tight_layout()  # the legend sits outside the actogram axes
         self.canvas.draw_idle()
 
     def _after_edit(self, message: str) -> None:
@@ -2016,7 +2506,43 @@ class ReviewWindow:
         self.status_var.set(message)
 
     # ------------------------------------------------------------------ #
-    # Editing
+    # Actogram period
+    # ------------------------------------------------------------------ #
+
+    def _set_period(self, value: float) -> None:
+        self.period_var.set(f"{value:g}")
+        self._apply_period()
+
+    def _apply_period(self, _event=None) -> None:
+        if self._closed:
+            return
+        try:
+            value = round(float(self.period_var.get()), 2)
+            valid = ACTOGRAM_MIN_PERIOD_HOURS <= value <= ACTOGRAM_MAX_PERIOD_HOURS
+        except (ValueError, tk.TclError):
+            valid = False
+        if not valid:
+            self.period_var.set(f"{self.day_length:g}")
+            self.status_var.set(
+                f"The actogram period must be a number between "
+                f"{ACTOGRAM_MIN_PERIOD_HOURS:g} and {ACTOGRAM_MAX_PERIOD_HOURS:g} hours."
+            )
+            return
+        self.period_var.set(f"{value:g}")
+        if value != self.day_length:
+            self.day_length = value
+            self._draw_actogram_preview()
+            self.status_var.set(f"Actogram period of channel {self.channel} set to {value:g} h.")
+
+    def _period_to_all(self) -> None:
+        self._apply_period()
+        value = self.day_length
+        self.periods = {ch: value for ch in CHANNELS}
+        self._draw_actogram_preview()
+        self.status_var.set(f"Actogram period {value:g} h applied to all channels.")
+
+    # ------------------------------------------------------------------ #
+    # Editing the peaks/troughs in the top plot
     # ------------------------------------------------------------------ #
 
     def _toolbar_active(self) -> bool:
@@ -2053,6 +2579,7 @@ class ReviewWindow:
             return
         kind, index = candidates[nearest]
         (peaks if kind == "peak" else troughs).remove(index)
+        self.reg_sel[channel][0 if kind == "peak" else 1].discard(index)
         hour = float(self.smooth.loc[index, "Hours"])
         self._after_edit(f"Removed {kind} at {hour:.2f} h.")
 
@@ -2076,11 +2603,13 @@ class ReviewWindow:
             return
         target.append(index)
         target.sort()
+        self.reg_sel[channel][0 if kind == "peak" else 1].add(index)  # new points count
         self._after_edit(f"Added {kind} at {hour:.2f} h.")
 
     def _reset_channel(self) -> None:
         peaks, troughs = self.auto[self.channel]
         self.selection[self.channel] = (list(peaks), list(troughs))
+        self.reg_sel[self.channel] = (set(peaks), set(troughs))
         self._after_edit(f"Channel {self.channel} reset to the automatic detection.")
 
     def _reset_all(self) -> None:
@@ -2089,11 +2618,126 @@ class ReviewWindow:
         ):
             return
         self.selection = {ch: (list(p), list(t)) for ch, (p, t) in self.auto.items()}
+        self.reg_sel = self._all_selected()
         for channel in CHANNELS:
             self._refresh_list_item(channel)
         self._draw_markers()
         self._draw_actogram_preview()
         self.status_var.set("All channels reset to the automatic detection.")
+
+    # ------------------------------------------------------------------ #
+    # Choosing the regression points in the actogram
+    # ------------------------------------------------------------------ #
+
+    def _actogram_hits(self) -> list:
+        """Every drawn point of the current channel: (kind index, row label, x, y)."""
+        peaks, troughs = self.selection[self.channel]
+        hits = []
+        for kind_number, indices in enumerate((peaks, troughs)):
+            for x, y, _hour, row in actogram_points(self.smooth, indices, self.day_length):
+                hits.append((kind_number, row, x, y))
+        return hits
+
+    def _set_selected(self, kind_number: int, row: int, selected: bool) -> None:
+        target = self.reg_sel[self.channel][kind_number]
+        if selected:
+            target.add(row)
+        else:
+            target.discard(row)
+
+    def _select_all(self, selected: bool) -> None:
+        peaks, troughs = self.selection[self.channel]
+        self.reg_sel[self.channel] = (
+            (set(peaks), set(troughs)) if selected else (set(), set())
+        )
+        self._draw_actogram_preview()
+        self.status_var.set(
+            "All peaks and troughs of this channel are used in the regression."
+            if selected
+            else "No points selected for the regression in this channel."
+        )
+
+    def _on_act_press(self, event) -> None:
+        if event.inaxes is not self.ax_act or event.button not in (1, 3):
+            return
+        if event.xdata is None or self._toolbar_active():
+            return
+        self._drag = {"x": event.xdata, "y": event.ydata, "px": event.x, "py": event.y,
+                      "button": event.button}
+
+    def _on_act_motion(self, event) -> None:
+        drag = self._drag
+        if drag is None or event.x is None:
+            return
+        if math.hypot(event.x - drag["px"], event.y - drag["py"]) < self.DRAG_THRESHOLD_PX:
+            return
+        x1, y1 = self.ax_act.transData.inverted().transform((event.x, event.y))
+        x0, y0 = drag["x"], drag["y"]
+        if self._drag_patch is None:
+            from matplotlib.patches import Rectangle
+
+            color = "tab:green" if drag["button"] == 1 else "tab:gray"
+            self._drag_patch = self.ax_act.add_patch(
+                Rectangle((x0, y0), 0, 0, fill=True, alpha=0.2, facecolor=color,
+                          edgecolor=color, linestyle="--", zorder=6)
+            )
+        self._drag_patch.set_bounds(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
+        self.canvas.draw_idle()
+
+    def _on_act_release(self, event) -> None:
+        drag, self._drag = self._drag, None
+        if self._drag_patch is not None:
+            try:
+                self._drag_patch.remove()
+            except (NotImplementedError, ValueError):
+                pass
+            self._drag_patch = None
+        if drag is None or event.x is None:
+            return
+        moved = math.hypot(event.x - drag["px"], event.y - drag["py"])
+        if moved < self.DRAG_THRESHOLD_PX:
+            if drag["button"] == 1:
+                self._toggle_nearest(drag["px"], drag["py"])
+            else:
+                self.canvas.draw_idle()
+            return
+        x1, y1 = self.ax_act.transData.inverted().transform((event.x, event.y))
+        x_lo, x_hi = sorted((drag["x"], x1))
+        y_lo, y_hi = sorted((drag["y"], y1))
+        select = drag["button"] == 1
+        count = 0
+        for kind_number, row, x, y in self._actogram_hits():
+            if x_lo <= x <= x_hi and y_lo <= y <= y_hi:
+                self._set_selected(kind_number, row, select)
+                count += 1
+        self._draw_actogram_preview()
+        self.status_var.set(
+            f"{'Selected' if select else 'Deselected'} the points in the box "
+            f"({count} drawn points touched)."
+        )
+
+    def _toggle_nearest(self, pixel_x: float, pixel_y: float) -> None:
+        hits = self._actogram_hits()
+        if not hits:
+            self.status_var.set("There are no peaks or troughs in this channel.")
+            return
+        points = np.array([(x, y) for _k, _r, x, y in hits], dtype=float)
+        pixels = self.ax_act.transData.transform(points)
+        distances = np.hypot(pixels[:, 0] - pixel_x, pixels[:, 1] - pixel_y)
+        nearest = int(np.argmin(distances))
+        if distances[nearest] > self.HIT_RADIUS_PX:
+            self.status_var.set("No point near the click.")
+            return
+        kind_number, row, _x, _y = hits[nearest]
+        now_selected = row not in self.reg_sel[self.channel][kind_number]
+        self._set_selected(kind_number, row, now_selected)
+        self._draw_actogram_preview()
+        hour = float(self.smooth.loc[row, "Hours"])
+        kind = "peak" if kind_number == 0 else "trough"
+        self.status_var.set(
+            f"{'Using' if now_selected else 'Not using'} the {kind} at {hour:.2f} h "
+            "for the regression."
+        )
 
     # ------------------------------------------------------------------ #
     # Save / load / finish
@@ -2109,9 +2753,12 @@ class ReviewWindow:
         )
         if not path:
             return
+        self._apply_period()
         try:
             save_peaks_json(
-                path, self.selection, self.smooth["Hours"], self.analysis.input_path.name
+                path, self.selection, self.smooth["Hours"], self.analysis.input_path.name,
+                reg_selection={ch: self._used(ch) for ch in CHANNELS},
+                actogram_period=self.periods,
             )
         except OSError as error:
             messagebox.showerror(APP_TITLE, f"Could not save the file: {error}", parent=self.win)
@@ -2127,11 +2774,22 @@ class ReviewWindow:
         if not path:
             return
         try:
-            loaded, skipped = load_peaks_json(path, self.smooth["Hours"])
+            loaded, skipped, loaded_reg, loaded_period = load_peaks_json(
+                path, self.smooth["Hours"]
+            )
         except (OSError, ValueError) as error:
             messagebox.showerror(APP_TITLE, f"Could not load the file: {error}", parent=self.win)
             return
         self.selection.update(loaded)
+        for channel, (peaks, troughs) in loaded.items():
+            self.reg_sel[channel] = (set(peaks), set(troughs))  # default: use everything
+        for channel, (peaks, troughs) in (loaded_reg or {}).items():
+            if channel in loaded:
+                self.reg_sel[channel] = (set(peaks), set(troughs))
+        if loaded_period is not None:
+            for channel, value in loaded_period.items():
+                self.periods[channel] = self._clamp_period(value)
+            self.period_var.set(f"{self.day_length:g}")
         for channel in CHANNELS:
             self._refresh_list_item(channel)
         self._draw_markers()
@@ -2140,6 +2798,7 @@ class ReviewWindow:
         self.status_var.set(f"Loaded: {Path(path).name}{note}")
 
     def _close(self) -> None:
+        self._closed = True
         try:
             self.win.grab_release()
         except tk.TclError:
@@ -2147,9 +2806,12 @@ class ReviewWindow:
         self.win.destroy()
 
     def _ok(self) -> None:
+        self._apply_period()  # commit a value typed but not yet confirmed
         selection = {ch: (sorted(p), sorted(t)) for ch, (p, t) in self.selection.items()}
+        reg_selection = {ch: self._used(ch) for ch in CHANNELS}
+        period = dict(self.periods)
         self._close()
-        self.on_ok(selection)
+        self.on_ok(selection, reg_selection, period)
 
     def _cancel(self) -> None:
         self._close()
