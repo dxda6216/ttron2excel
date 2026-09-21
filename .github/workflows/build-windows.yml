@@ -1,12 +1,12 @@
-name: Build Windows EXE
+name: Build Windows exe
 
 on:
-  workflow_dispatch:        
   push:
-    tags: ["v*"]            
+    tags: ["v*"]          # e.g. git tag v1.0.0 && git push origin v1.0.0
+  workflow_dispatch:      # manual run from the Actions tab
 
 permissions:
-  contents: write           
+  contents: write         # needed to attach the exe to a GitHub Release
 
 jobs:
   build:
@@ -18,26 +18,48 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      - name: Build with PyInstaller
-        run: pyinstaller --noconfirm --windowed --name TTron2Excel --hidden-import openpyxl --hidden-import matplotlib.backends.backend_tkagg ttron2excel_app.py
+      - name: Check that the app imports (tkinter included)
+        run: python -c "import ttron2excel_app; print('import OK')"
 
-      - name: Zip the app folder
+      - name: Build exe with PyInstaller
+        run: >
+          pyinstaller ttron2excel_app.py
+          --name ttron2excel
+          --onefile
+          --windowed
+          --noconfirm
+          --clean
+          --hidden-import matplotlib.backends.backend_tkagg
+          --hidden-import matplotlib.backends.backend_pdf
+          --hidden-import openpyxl
+          --exclude-module IPython
+          --exclude-module pytest
+
+      - name: Package
         shell: pwsh
-        run: Compress-Archive -Path dist/TTron2Excel -DestinationPath TTron2Excel-windows.zip
+        run: |
+          Compress-Archive -Path dist\ttron2excel.exe -DestinationPath dist\ttron2excel-windows.zip
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: TTron2Excel-windows
-          path: TTron2Excel-windows.zip
+          name: ttron2excel-windows
+          path: |
+            dist/ttron2excel.exe
+            dist/ttron2excel-windows.zip
 
-      - name: Attach to GitHub Release (tag pushes only)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Attach to GitHub Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: TTron2Excel-windows.zip
+          files: |
+            dist/ttron2excel.exe
+            dist/ttron2excel-windows.zip
+          generate_release_notes: true
