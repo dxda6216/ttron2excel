@@ -360,6 +360,7 @@ def selection_differs(selection: PeakSelection, auto: PeakSelection) -> bool:
 # --------------------------------------------------------------------------- #
 
 REGRESSION_MIN_POINTS = 3          # a line through 2 points has no error estimate
+REGRESSION_MIN_PERIOD_HOURS = 18.0  # shorter fitted periods are treated as mis-numbered cycles
 ACTOGRAM_MIN_PERIOD_HOURS = 12.0   # range of the adjustable actogram period
 ACTOGRAM_MAX_PERIOD_HOURS = 60.0
 
@@ -371,6 +372,7 @@ REGRESSION_COLUMNS = [
     "Period (Hours)",
     "Period SE (Hours)",
     "R squared",
+    "Residual SD (Hours)",
     "Phase (Hours)",
     "Phase (radians)",
     "Fitted Time at Cycle 0 (Hours)",
@@ -410,15 +412,8 @@ def used_selection(selection_entry, reg_entry) -> tuple[list[int], list[int]]:
     )
 
 
-def assign_cycle_numbers(times: np.ndarray, period_guess: float) -> np.ndarray:
-    """Number the (sorted) event times 0, 1, 2 ... allowing skipped cycles.
-
-    The gap between two consecutive selected events is rounded to a whole
-    number of cycles; the period used for rounding is refined iteratively
-    from the gaps themselves, starting at `period_guess`.
-    """
-    gaps = np.diff(times)
-    period = float(period_guess)
+def _refine_cycles(gaps: np.ndarray, period: float) -> tuple[np.ndarray, float]:
+    """Round every gap to whole cycles and re-estimate the period, until stable."""
     for _ in range(50):
         steps = np.maximum(1.0, np.rint(gaps / period))
         new_period = float(gaps.sum() / steps.sum())
@@ -426,7 +421,26 @@ def assign_cycle_numbers(times: np.ndarray, period_guess: float) -> np.ndarray:
             break
         period = new_period
     steps = np.maximum(1.0, np.rint(gaps / period))
-    return np.concatenate(([0.0], np.cumsum(steps)))
+    return np.concatenate(([0.0], np.cumsum(steps))), period
+
+
+def assign_cycle_numbers(times: np.ndarray, period_guess: float) -> np.ndarray:
+    """Number the (sorted) event times 0, 1, 2 ... allowing skipped cycles.
+
+    The gap between two consecutive selected events is rounded to a whole
+    number of cycles; the period used for rounding is refined iteratively
+    from the gaps themselves, starting at `period_guess` (the actogram period).
+
+    A guess far below the real period (e.g. an actogram period of 12 h for
+    24 h data) would count every gap as 2 cycles and report half the period,
+    so if the result is shorter than REGRESSION_MIN_PERIOD_HOURS the numbering
+    is redone starting from the median gap between the selected events.
+    """
+    gaps = np.diff(times)
+    cycles, period = _refine_cycles(gaps, float(period_guess))
+    if period < REGRESSION_MIN_PERIOD_HOURS:
+        cycles, _ = _refine_cycles(gaps, float(np.median(gaps)))
+    return cycles
 
 
 def regress_period_phase(times, period_guess: float) -> dict | None:
@@ -442,12 +456,16 @@ def regress_period_phase(times, period_guess: float) -> dict | None:
     fit = stats.linregress(cycles, t)
     period = float(fit.slope)
     intercept = float(fit.intercept)
+    residuals = t - (intercept + period * cycles)
+    # standard error of the regression: sqrt(SS_res / (n - 2))
+    residual_sd = float(np.sqrt(np.sum(residuals**2) / (len(t) - 2)))
     phase_hours = intercept % period
     return {
         "n": len(t),
         "period": period,
         "period_se": float(fit.stderr),
         "r2": float(fit.rvalue) ** 2,
+        "residual_sd": residual_sd,
         "intercept": intercept,
         "phase_h": phase_hours,
         "phase_rad": 2.0 * math.pi * phase_hours / period,
@@ -529,6 +547,7 @@ def regression_tables(
                         "Period (Hours)": result["period"],
                         "Period SE (Hours)": result["period_se"],
                         "R squared": result["r2"],
+                        "Residual SD (Hours)": result["residual_sd"],
                         "Phase (Hours)": result["phase_h"],
                         "Phase (radians)": result["phase_rad"],
                         "Fitted Time at Cycle 0 (Hours)": result["intercept"],
