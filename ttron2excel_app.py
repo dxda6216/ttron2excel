@@ -374,7 +374,7 @@ REGRESSION_COLUMNS = [
     "R squared",
     "Residual SD (Hours)",
     "Phase (Hours)",
-    "Phase (radians)",
+    "Phase (degrees)",
     "Fitted Time at Cycle 0 (Hours)",
 ]
 REGRESSION_POINT_COLUMNS = [
@@ -468,7 +468,7 @@ def regress_period_phase(times, period_guess: float) -> dict | None:
         "residual_sd": residual_sd,
         "intercept": intercept,
         "phase_h": phase_hours,
-        "phase_rad": 2.0 * math.pi * phase_hours / period,
+        "phase_deg": 360.0 * phase_hours / period,
         "cycles": cycles,
         "times": t,
         "fitted": intercept + period * cycles,
@@ -516,7 +516,7 @@ def regression_summary_text(regression: dict | None, n_peaks: int, n_troughs: in
         se_text = f" \u00b1 {se:.2f} (SE)" if np.isfinite(se) else ""
         lines.append(
             f"{name} (n={n}): period = {result['period']:.2f}{se_text} h,  "
-            f"phase = {result['phase_h']:.2f} h ({result['phase_rad']:.2f} rad),  "
+            f"phase = {result['phase_h']:.2f} h ({result['phase_deg']:.1f}\u00b0),  "
             f"R\u00b2 = {result['r2']:.3f}"
         )
     return "\n".join(lines)
@@ -549,7 +549,7 @@ def regression_tables(
                         "R squared": result["r2"],
                         "Residual SD (Hours)": result["residual_sd"],
                         "Phase (Hours)": result["phase_h"],
-                        "Phase (radians)": result["phase_rad"],
+                        "Phase (degrees)": result["phase_deg"],
                         "Fitted Time at Cycle 0 (Hours)": result["intercept"],
                     }
                 )
