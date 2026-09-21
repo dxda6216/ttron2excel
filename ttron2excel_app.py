@@ -2800,6 +2800,7 @@ class ReviewWindow:
         ax.set_xlim(x_min, x_max)
         ax.xaxis.set_major_locator(MultipleLocator(HOURS_PER_DAY))
         ax.set_ylim(0, upper_ylimit(self.raw[channel]))
+        ax.set_xlabel("Hours")
         ax.set_ylabel("Bioluminescence")
         ax.legend(loc="upper right", fontsize=7, framealpha=0.6)
         ax.set_navigate(False)  # zoom/pan applies to the detrended plot only
@@ -2932,7 +2933,7 @@ class ReviewWindow:
                         fontsize=7, color=color, ha="center", va=va, clip_on=True,
                     )
                 )
-        ax.legend(loc="upper right", fontsize=7, framealpha=0.6)
+        # No legend here: the colours are self-explanatory and the PDF has the legend.
 
     def _draw_actogram_preview(self) -> None:
         settings = self.analysis.settings
