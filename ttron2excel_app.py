@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import io
 import json
 import math
 import os
@@ -27,7 +28,7 @@ import threading
 import traceback
 import tkinter as tk
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -151,13 +152,14 @@ def read_traces(path: str) -> Recording:
     return Recording(filename=path, data=data.loc[:, COLUMN_NAMES])
 
 
-def rolling_mean(data: pd.DataFrame, window: int) -> pd.DataFrame:
+def rolling_mean(data: pd.DataFrame, window: int, channels=None) -> pd.DataFrame:
     """Centered moving average of the channel columns; 'Hours' is left alone.
 
     (Smoothing 'Hours' as well would shift the time axis at the edges, where
     min_periods=1 averages over an incomplete window.)
     """
-    smoothed = data[CHANNELS].rolling(window=window, center=True, min_periods=1).mean()
+    channels = CHANNELS if channels is None else list(channels)
+    smoothed = data[channels].rolling(window=window, center=True, min_periods=1).mean()
     smoothed.insert(0, "Hours", data["Hours"])
     return smoothed
 
@@ -165,6 +167,10 @@ def rolling_mean(data: pd.DataFrame, window: int) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Detrending
 # --------------------------------------------------------------------------- #
+
+DETREND_METHODS = ("Sinc Filter", "Moving Average")
+DETREND_MAX_HOURS = 240.0   # upper limit of the moving-average window / sinc cutoff period
+
 
 @dataclass
 class Trend:
@@ -174,10 +180,79 @@ class Trend:
     label: str          # shown in plot legends
     short_label: str    # used in the Excel sheet name (31-character limit)
     summary: str        # shown on the 'Note' sheet
+    labels: dict = field(default_factory=dict)      # channel -> legend text
+    summaries: dict = field(default_factory=dict)   # channel -> summary
+
+    def label_for(self, channel: str) -> str:
+        return self.labels.get(channel, self.label)
+
+
+@dataclass(frozen=True)
+class DetrendParams:
+    """How the trend of one channel is calculated (only the fields of the chosen method count)."""
+
+    method: str = "Sinc Filter"
+    window_hours: float = 24.0            # Moving Average
+    cutoff_period_hours: float = 48.0     # Sinc Filter
+    order: int = 101                      # Sinc Filter
+
+    def key(self) -> tuple:
+        if self.method == "Moving Average":
+            return (self.method, float(self.window_hours))
+        return (self.method, float(self.cutoff_period_hours), int(self.order))
+
+    def same_as(self, other: "DetrendParams") -> bool:
+        return self.key() == other.key()
+
+    def describe(self) -> str:
+        if self.method == "Moving Average":
+            return f"Moving Average, window {self.window_hours:g} h"
+        return f"Sinc Filter, cutoff {self.cutoff_period_hours:g} h, order {self.order}"
+
+
+def default_detrend_params(settings) -> DetrendParams:
+    return DetrendParams(
+        method=settings.detrending_method,
+        window_hours=float(settings.moving_average_window),
+        cutoff_period_hours=float(settings.sinc_cutoff_period_hours),
+        order=int(settings.sinc_order),
+    )
+
+
+def same_detrend_params(a: dict, b: dict) -> bool:
+    return all(a[ch].same_as(b[ch]) for ch in CHANNELS)
+
+
+def check_detrend_params(params: DetrendParams, time_interval: float, n_points: int) -> str | None:
+    """A message describing what is wrong with the parameters, or None if they are usable."""
+    duration = time_interval * (n_points - 1)
+    if params.method == "Moving Average":
+        if not params.window_hours >= 3 * time_interval:
+            return (
+                "The moving-average window must be at least 3 sampling intervals "
+                f"({3 * time_interval:.2f} h)."
+            )
+        if params.window_hours > DETREND_MAX_HOURS:
+            return f"The moving-average window must not exceed {DETREND_MAX_HOURS:g} h."
+        if params.window_hours > duration:
+            return f"The moving-average window is longer than the recording ({duration:.1f} h)."
+    elif params.method == "Sinc Filter":
+        if not params.cutoff_period_hours > 2 * time_interval:
+            return (
+                "The cutoff period must be longer than 2 sampling intervals "
+                f"({2 * time_interval:.2f} h)."
+            )
+        if params.cutoff_period_hours > DETREND_MAX_HOURS:
+            return f"The cutoff period must not exceed {DETREND_MAX_HOURS:g} h."
+        if params.order < 3:
+            return "The sinc filter order must be at least 3."
+    else:
+        return f"Unknown detrending method: {params.method!r}"
+    return None
 
 
 def moving_average_trend(
-    data: pd.DataFrame, window_hours: float, time_interval: float
+    data: pd.DataFrame, window_hours: float, time_interval: float, channels=None
 ) -> Trend:
     n_points = math.ceil(window_hours / time_interval)
     if n_points % 2 == 0:
@@ -188,7 +263,7 @@ def moving_average_trend(
         f"{window_span:.6f} h ({n_points} points)"
     )
 
-    trend = rolling_mean(data, n_points).bfill().ffill()
+    trend = rolling_mean(data, n_points, channels).bfill().ffill()
     return Trend(
         data=trend,
         label=f"{n_points}-point moving average, centered",
@@ -198,8 +273,13 @@ def moving_average_trend(
 
 
 def sinc_filter_trend(
-    data: pd.DataFrame, cutoff_period_hours: float, order: int, time_interval: float
+    data: pd.DataFrame,
+    cutoff_period_hours: float,
+    order: int,
+    time_interval: float,
+    channels=None,
 ) -> Trend:
+    channels = CHANNELS if channels is None else list(channels)
     n_points = len(data.index)
     sampling_rate = 1.0 / time_interval                 # samples per hour
     cutoff_frequency = 1.0 / cutoff_period_hours        # cycles per hour
@@ -228,7 +308,7 @@ def sinc_filter_trend(
     taps = signal.firwin(order, norm_cutoff, pass_zero="lowpass")
 
     trend = data.copy()
-    for channel in CHANNELS:
+    for channel in channels:
         if not data[channel].notna().any():
             trend[channel] = np.nan
             continue
@@ -258,12 +338,70 @@ def build_trend(
     window_hours: float,
     cutoff_period_hours: float,
     order: int,
+    channels=None,
 ) -> Trend:
     if method == "Moving Average":
-        return moving_average_trend(data, window_hours, time_interval)
+        return moving_average_trend(data, window_hours, time_interval, channels)
     if method == "Sinc Filter":
-        return sinc_filter_trend(data, cutoff_period_hours, order, time_interval)
+        return sinc_filter_trend(data, cutoff_period_hours, order, time_interval, channels)
     raise ValueError(f"Unknown detrending method: {method!r}")
+
+
+def _build_for(raw: pd.DataFrame, params: DetrendParams, time_interval: float, channels) -> Trend:
+    return build_trend(
+        raw,
+        params.method,
+        time_interval,
+        window_hours=params.window_hours,
+        cutoff_period_hours=params.cutoff_period_hours,
+        order=int(params.order),
+        channels=channels,
+    )
+
+
+def build_channel_trends(raw: pd.DataFrame, params: dict, time_interval: float) -> Trend:
+    """Trend of every channel, each with its own DetrendParams ({channel: params}).
+
+    Channels that share the same parameters are filtered together.
+    """
+    groups: dict = {}
+    for channel in CHANNELS:
+        groups.setdefault(params[channel].key(), (params[channel], []))[1].append(channel)
+
+    columns, labels, summaries, first = {}, {}, {}, None
+    for group_params, channels in groups.values():
+        trend = _build_for(raw, group_params, time_interval, channels)
+        first = first or trend
+        for channel in channels:
+            columns[channel] = trend.data[channel]
+            labels[channel] = trend.label
+            summaries[channel] = trend.summary
+    data = pd.DataFrame({"Hours": raw["Hours"], **{ch: columns[ch] for ch in CHANNELS}})
+
+    if len(groups) == 1:
+        return Trend(data, first.label, first.short_label, first.summary, labels, summaries)
+    return Trend(
+        data,
+        "per-channel settings",
+        "per channel",
+        "Set per channel (see the 'Detrend Settings' sheet)",
+        labels,
+        summaries,
+    )
+
+
+def channel_trend(
+    raw: pd.DataFrame, channel: str, params: DetrendParams, time_interval: float
+) -> tuple[pd.Series, str]:
+    """(trend of one channel, its legend text); used by the review window."""
+    with contextlib.redirect_stdout(io.StringIO()):  # the filters print their settings
+        trend = _build_for(raw, params, time_interval, [channel])
+    return trend.data[channel], trend.label
+
+
+def smooth_series(series: pd.Series, window: int) -> pd.Series:
+    """Same centered moving average as rolling_mean(), for one column."""
+    return series.rolling(window=window, center=True, min_periods=1).mean()
 
 
 def detrend(data: pd.DataFrame, trend: pd.DataFrame) -> pd.DataFrame:
@@ -271,6 +409,36 @@ def detrend(data: pd.DataFrame, trend: pd.DataFrame) -> pd.DataFrame:
     detrended = data[CHANNELS] - trend[CHANNELS]
     detrended.insert(0, "Hours", data["Hours"])
     return detrended
+
+
+def detrend_settings_table(params: dict, trend: Trend) -> pd.DataFrame:
+    """One row per channel describing how its trend was calculated (for Excel)."""
+    rows = []
+    for channel in CHANNELS:
+        p = params[channel]
+        moving = p.method == "Moving Average"
+        rows.append(
+            {
+                "Channel": channel,
+                "Detrending Method": p.method,
+                "Moving Average Window (Hours)": p.window_hours if moving else np.nan,
+                "Sinc Cutoff Period (Hours)": np.nan if moving else p.cutoff_period_hours,
+                "Sinc Filter Order (requested)": np.nan if moving else int(p.order),
+                "Trend Line (as calculated)": trend.label_for(channel),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def describe_methods(params: dict) -> str:
+    """Short text for titles/notes: the method, or how the channels differ."""
+    keys = {p.key() for p in params.values()}
+    methods = sorted({p.method for p in params.values()})
+    if len(keys) == 1:
+        return methods[0]
+    if len(methods) == 1:
+        return f"{methods[0]}, per-channel parameters"
+    return "per-channel methods"
 
 
 # --------------------------------------------------------------------------- #
@@ -360,9 +528,8 @@ def selection_differs(selection: PeakSelection, auto: PeakSelection) -> bool:
 # --------------------------------------------------------------------------- #
 
 REGRESSION_MIN_POINTS = 3          # a line through 2 points has no error estimate
-REGRESSION_MIN_PERIOD_HOURS = 18.0  # shorter fitted periods are treated as mis-numbered cycles
-ACTOGRAM_MIN_PERIOD_HOURS = 12.0   # range of the adjustable actogram period
-ACTOGRAM_MAX_PERIOD_HOURS = 60.0
+ACTOGRAM_MIN_PERIOD_HOURS = 6.0    # range of the adjustable actogram period
+ACTOGRAM_MAX_PERIOD_HOURS = 240.0
 
 REGRESSION_COLUMNS = [
     "Channel",
@@ -428,19 +595,25 @@ def assign_cycle_numbers(times: np.ndarray, period_guess: float) -> np.ndarray:
     """Number the (sorted) event times 0, 1, 2 ... allowing skipped cycles.
 
     The gap between two consecutive selected events is rounded to a whole
-    number of cycles; the period used for rounding is refined iteratively
-    from the gaps themselves, starting at `period_guess` (the actogram period).
-
-    A guess far below the real period (e.g. an actogram period of 12 h for
-    24 h data) would count every gap as 2 cycles and report half the period,
-    so if the result is shorter than REGRESSION_MIN_PERIOD_HOURS the numbering
-    is redone starting from the median gap between the selected events.
+    number of cycles.  Two starting points are tried and refined - the median
+    gap (i.e. "neighbouring selected events are neighbouring cycles") and
+    `period_guess` (the actogram period, which also copes with irregular
+    skipping when it is close to the real period).  Numberings that fit the
+    times equally well differ only by a common factor (P versus P/2 ...), and
+    then the one with the longest period, i.e. the fewest cycles, is used.
+    So a 60 h rhythm is never reported as 30 h just because the actogram
+    period is 24 h, or a 24 h rhythm as 12 h because it is 12 h.
     """
     gaps = np.diff(times)
-    cycles, period = _refine_cycles(gaps, float(period_guess))
-    if period < REGRESSION_MIN_PERIOD_HOURS:
-        cycles, _ = _refine_cycles(gaps, float(np.median(gaps)))
-    return cycles
+    candidates = []
+    for start in (float(np.median(gaps)), float(period_guess)):
+        cycles, period = _refine_cycles(gaps, start)
+        fit = np.polyfit(cycles, times, 1)
+        rms = float(np.sqrt(np.mean((times - np.polyval(fit, cycles)) ** 2)))
+        candidates.append((rms, period, cycles))
+    best_rms = min(c[0] for c in candidates)
+    close = [c for c in candidates if c[0] <= best_rms + 1e-6]   # equally good fits
+    return max(close, key=lambda c: c[1])[2]
 
 
 def regress_period_phase(times, period_guess: float) -> dict | None:
@@ -583,6 +756,7 @@ def save_peaks_json(
     traces_file: str,
     reg_selection: RegSelection | None = None,
     actogram_period=None,
+    detrend_params: dict | None = None,
 ) -> None:
     """Save the peak/trough selection (by time, so it survives re-processing).
 
@@ -602,6 +776,14 @@ def save_peaks_json(
             entry["regression_troughs"] = [float(hours.loc[i]) for i in sorted(reg_troughs)]
         if periods is not None:
             entry["actogram_period"] = periods[channel]
+        if detrend_params is not None and channel in detrend_params:
+            p = detrend_params[channel]
+            entry["detrend"] = {
+                "method": p.method,
+                "window_hours": float(p.window_hours),
+                "cutoff_period_hours": float(p.cutoff_period_hours),
+                "order": int(p.order),
+            }
         channels[channel] = entry
     payload = {
         "format": PEAKS_JSON_FORMAT,
@@ -615,7 +797,7 @@ def load_peaks_json(path, hours: pd.Series):
     """Load a saved selection.
 
     Returns (selection, number of times not matched, regression selection or
-    None, {channel: actogram period} or None).
+    None, {channel: actogram period} or None, {channel: DetrendParams} or None).
     """
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("format") != PEAKS_JSON_FORMAT:
@@ -662,7 +844,21 @@ def load_peaks_json(path, hours: pd.Series):
                 periods[channel] = value
     if legacy:
         periods = {ch: periods.get(ch, legacy) for ch in CHANNELS}
-    return result, skipped, (regression or None), (periods or None)
+
+    detrend_params = {}
+    for channel, entry in payload.get("channels", {}).items():
+        d = entry.get("detrend")
+        if channel in CHANNELS and isinstance(d, dict) and d.get("method") in DETREND_METHODS:
+            try:
+                detrend_params[channel] = DetrendParams(
+                    method=d["method"],
+                    window_hours=float(d.get("window_hours", 24.0)),
+                    cutoff_period_hours=float(d.get("cutoff_period_hours", 48.0)),
+                    order=int(d.get("order", 101)),
+                )
+            except (TypeError, ValueError):
+                pass
+    return result, skipped, (regression or None), (periods or None), (detrend_params or None)
 
 
 # --------------------------------------------------------------------------- #
@@ -697,11 +893,14 @@ def write_main_workbook(
     peaks_troughs: pd.DataFrame,
     regression: pd.DataFrame | None = None,
     regression_points: pd.DataFrame | None = None,
+    detrend_settings: pd.DataFrame | None = None,
 ) -> None:
     with pd.ExcelWriter(path) as writer:
         note.to_excel(writer, sheet_name="Note", index=False, header=False)
         if regression is not None:  # second sheet, so it is easy to find
             regression.to_excel(writer, sheet_name=REGRESSION_SHEET, index=False)
+        if detrend_settings is not None:
+            detrend_settings.to_excel(writer, sheet_name="Detrend Settings", index=False)
         raw.to_excel(writer, sheet_name="Raw Data")
         for window, frame in smoothed.items():
             frame.to_excel(
@@ -997,7 +1196,7 @@ def _draw_actogram(
 
     n_days = max(last_hour // day_length, 1)
     ax.set_ylim(-n_days * 0.05, n_days * 1.05)
-    ax.yaxis.set_major_locator(MultipleLocator(base=1))
+    ax.yaxis.set_major_locator(MultipleLocator(base=max(1, math.ceil(n_days / 40))))
     ax.set_xlabel("Time (Hours)", fontsize=10)
     ax.grid(True, linestyle="--", alpha=0.7)
     if ax.get_legend_handles_labels()[0]:  # nothing detected on a flat channel
@@ -1046,7 +1245,7 @@ def plot_channel_page(
         )
         ax_raw.plot(
             trend.data["Hours"], trend.data[channel], "-r", linewidth=1.0,
-            label=f"Trend line ({trend.label})",
+            label=f"Trend line ({trend.label_for(channel)})",
         )
         axis.apply(ax_raw)
         ax_raw.set_ylim(0, upper_ylimit(raw[channel]))
@@ -1382,6 +1581,7 @@ class Analysis:
     detrended: pd.DataFrame
     detrended_smoothed: dict
     auto_peaks: PeakSelection
+    detrend_params: dict = field(default_factory=dict)   # channel -> DetrendParams
 
     @property
     def raw(self) -> pd.DataFrame:
@@ -1398,6 +1598,14 @@ def _reporter(progress):
             progress(min(max(fraction, 0.0), 1.0), text)
 
     return report
+
+
+def compute_detrend(raw: pd.DataFrame, params: dict, time_interval: float):
+    """(Trend, detrended data, {window: smoothed detrended data}) for per-channel params."""
+    trend = build_channel_trends(raw, params, time_interval)
+    detrended = detrend(raw, trend.data)
+    detrended_smoothed = {w: rolling_mean(detrended, w) for w in SMOOTHING_WINDOWS}
+    return trend, detrended, detrended_smoothed
 
 
 def analyze(input_path, settings: Settings, progress=None) -> Analysis:
@@ -1428,16 +1636,8 @@ def analyze(input_path, settings: Settings, progress=None) -> Analysis:
     report(0.3, "Detrending...")
     print(f"\nCalculating trend line and detrended data using {s.detrending_method}...")
     smoothed = {window: rolling_mean(raw, window) for window in SMOOTHING_WINDOWS}
-    trend = build_trend(
-        raw,
-        s.detrending_method,
-        time_interval,
-        window_hours=s.moving_average_window,
-        cutoff_period_hours=s.sinc_cutoff_period_hours,
-        order=int(s.sinc_order),
-    )
-    detrended = detrend(raw, trend.data)
-    detrended_smoothed = {w: rolling_mean(detrended, w) for w in SMOOTHING_WINDOWS}
+    params = {ch: default_detrend_params(s) for ch in CHANNELS}
+    trend, detrended, detrended_smoothed = compute_detrend(raw, params, time_interval)
 
     report(0.8, "Detecting peaks and troughs...")
     auto_peaks = detect_all_peaks(detrended_smoothed[9], time_interval)
@@ -1454,6 +1654,25 @@ def analyze(input_path, settings: Settings, progress=None) -> Analysis:
         detrended=detrended,
         detrended_smoothed=detrended_smoothed,
         auto_peaks=auto_peaks,
+        detrend_params=params,
+    )
+
+
+def redetrend(analysis: Analysis, params: dict) -> Analysis:
+    """A copy of `analysis` with another detrending for some or all channels.
+
+    The automatic peak detection is redone on the new detrended data.
+    """
+    trend, detrended, detrended_smoothed = compute_detrend(
+        analysis.raw, params, analysis.time_interval
+    )
+    return replace(
+        analysis,
+        trend=trend,
+        detrended=detrended,
+        detrended_smoothed=detrended_smoothed,
+        auto_peaks=detect_all_peaks(detrended_smoothed[9], analysis.time_interval),
+        detrend_params=dict(params),
     )
 
 
@@ -1464,6 +1683,7 @@ def write_outputs(
     progress=None,
     reg_selection: RegSelection | None = None,
     actogram_period=None,
+    detrend_params: dict | None = None,
 ) -> list[Path]:
     """Write the Excel files, ZIP and PDF. Returns the list of files written.
 
@@ -1471,10 +1691,19 @@ def write_outputs(
     `reg_selection` says which of them take part in the period/phase regression
     (default: all) and `actogram_period` is the actogram's x-axis period in hours:
     one number for every channel or a {channel: hours} dict (default: the value in
-    the settings, 24 h).
+    the settings, 24 h).  `detrend_params` is {channel: DetrendParams} when the
+    channels are detrended differently from `analysis` (the trend, detrended data and
+    automatic peaks are then recalculated).
     """
     report = _reporter(progress)
     s = analysis.settings
+    if detrend_params is not None and not same_detrend_params(
+        detrend_params, analysis.detrend_params
+    ):
+        print("Recalculating the trend lines with the per-channel detrend settings...")
+        analysis = redetrend(analysis, detrend_params)
+    params = analysis.detrend_params or {ch: default_detrend_params(s) for ch in CHANNELS}
+    method_text = describe_methods(params)
     recording = analysis.recording
     raw = analysis.raw
     time_interval = analysis.time_interval
@@ -1535,7 +1764,7 @@ def write_outputs(
             ("Number of Time Points", recording.n_points),
             ("Total Time Duration (Hours)", recording.duration_hours),
             ("Average Time Interval (Hours)", time_interval),
-            ("Detrending Method", s.detrending_method),
+            ("Detrending Method", method_text),
             ("Trend Line Parameter", trend.summary),
             ("Peaks and Troughs", "Edited manually" if edited else "Automatic detection"),
             ("Actogram Period (Hours)", periods_note),
@@ -1565,6 +1794,7 @@ def write_outputs(
         ),
         regression=regression_summary,
         regression_points=regression_points,
+        detrend_settings=detrend_settings_table(params, trend),
     )
     print(f"Excel file: {main_workbook.name}  has been generated.")
     report(0.20, "Writing Excel files...")
@@ -1590,7 +1820,7 @@ def write_outputs(
             channel_order=channel_order,
             scatter=raw,
             line=trend.data,
-            line_label=f"trend line ({s.detrending_method})",
+            line_label=f"trend line ({method_text})",
             label_suffix="",
             y_axis_label="Bioluminescence",
             axis=axis,
@@ -1601,7 +1831,7 @@ def write_outputs(
         report(0.30, "Plotting...")
         plot_overview_grid(
             pdf,
-            title=f"{s.experiment_number} - detrended data ({s.detrending_method})",
+            title=f"{s.experiment_number} - detrended data ({method_text})",
             channel_order=channel_order,
             scatter=detrended,
             line=detrended_smoothed[5],
@@ -1676,11 +1906,14 @@ def run_analysis(
     progress=None,
     peaks: PeakSelection | None = None,
     reg_selection: RegSelection | None = None,
-    actogram_period: float | None = None,
+    actogram_period=None,
+    detrend_params: dict | None = None,
 ) -> list[Path]:
     """analyze() + write_outputs() in one call (no review step)."""
     analysis = analyze(input_path, settings, progress)
-    return write_outputs(analysis, output_dir, peaks, progress, reg_selection, actogram_period)
+    return write_outputs(
+        analysis, output_dir, peaks, progress, reg_selection, actogram_period, detrend_params
+    )
 
 
 # =========================================================================== #
@@ -1879,7 +2112,7 @@ class App:
             self._slider(box, 2, "Sinc filter order (odd)", self.order_var, 1, 361, 2),
         ]
         self._ma_widgets = [
-            self._slider(box, 3, "Moving-average window (hours)", self.window_var, 1, 120, 1),
+            self._slider(box, 3, "Moving-average window (hours)", self.window_var, 1, 240, 1),
         ]
 
     def _build_plots(self, parent) -> None:
@@ -1896,7 +2129,7 @@ class App:
         ttk.Checkbutton(
             box, text="Label peaks/troughs in actogram", variable=self.label_act_var
         ).grid(row=5, column=0, columnspan=3, sticky="w")
-        self._slider(box, 6, "Actogram period (h, default)", self.acto_var, 12, 60, 0.1)
+        self._slider(box, 6, "Actogram period (h, default)", self.acto_var, 6, 240, 0.1)
 
     def _build_fit(self, parent) -> None:
         box = self._box(parent, "5. Damped sine fit (time range)")
@@ -2093,7 +2326,8 @@ class App:
             self.queue.put(("error", traceback.format_exc(), str(error)))
 
     def _export_worker(
-        self, analysis: Analysis, out_dir: str, peaks, reg_selection, actogram_period
+        self, analysis: Analysis, out_dir: str, peaks, reg_selection, actogram_period,
+        detrend_params=None,
     ) -> None:
         """Background thread, step 2: write Excel / ZIP / PDF files."""
         writer = _QueueWriter(self.queue)
@@ -2102,6 +2336,7 @@ class App:
                 outputs = write_outputs(
                     analysis, out_dir, peaks, progress=self._progress_callback(),
                     reg_selection=reg_selection, actogram_period=actogram_period,
+                    detrend_params=detrend_params,
                 )
             self.queue.put(("done", outputs))
         except Exception as error:  # noqa: BLE001 - shown to the user
@@ -2121,12 +2356,12 @@ class App:
                 float(analysis.settings.actogram_x_scale),
             )
 
-    def _start_export(self, peaks, reg_selection, actogram_period) -> None:
+    def _start_export(self, peaks, reg_selection, actogram_period, detrend_params=None) -> None:
         self.progress["value"] = 0
         self.status_var.set("Writing output files...")
         self._run_in_thread(
             self._export_worker, self.analysis, self.pending_out_dir,
-            peaks, reg_selection, actogram_period,
+            peaks, reg_selection, actogram_period, detrend_params,
         )
 
     def _on_review_cancel(self) -> None:
@@ -2207,7 +2442,10 @@ class ReviewWindow:
         "(ringed points are used); drag a box to select all points inside, right-drag to "
         "deselect them.   The actogram period (default 24 h) is set separately for each "
         "channel and is used for that channel's page in the PDF.   While a zoom/pan tool of the toolbar is active, clicks do not edit "
-        "anything.   Switch channels with the list or the Left/Right keys."
+        "anything.   Detrending (bottom of the controls) is chosen per channel: pick the method "
+        "and parameters and press Apply; the trend, the detrended curve and the automatic "
+        "peaks/troughs of that channel are recalculated (hand edits of the channel are "
+        "discarded).   Switch channels with the list or the Left/Right keys."
     )
 
     def __init__(self, parent, analysis: Analysis, on_ok, on_cancel) -> None:
@@ -2217,9 +2455,18 @@ class ReviewWindow:
         self.analysis = analysis
         self.on_ok = on_ok
         self.on_cancel = on_cancel
-        self.data = analysis.detrended
-        self.smooth = analysis.detrended_9pma
-        self.auto = analysis.auto_peaks
+        # Private copies: the detrending of single channels is changed in this window.
+        self.raw = analysis.raw
+        self.time_interval = analysis.time_interval
+        self.trend_cols = analysis.trend.data.copy()
+        self.data = analysis.detrended.copy()
+        self.smooth = analysis.detrended_9pma.copy()
+        self.auto = {ch: (list(p), list(t)) for ch, (p, t) in analysis.auto_peaks.items()}
+        self.default_params = default_detrend_params(analysis.settings)
+        self.params = dict(analysis.detrend_params) or {
+            ch: self.default_params for ch in CHANNELS
+        }
+        self.trend_labels = {ch: analysis.trend.label_for(ch) for ch in CHANNELS}
         self.selection = {ch: (list(p), list(t)) for ch, (p, t) in self.auto.items()}
         # peaks/troughs that take part in the regression (by default: all of them)
         self.reg_sel = self._all_selected()
@@ -2246,14 +2493,20 @@ class ReviewWindow:
         self.period_var = tk.StringVar(value=f"{self.day_length:g}")
         self.reg_var = tk.StringVar(value="")
 
-        ttk.Label(win, text=self.HELP, wraplength=1120, padding=(10, 8)).grid(
-            row=0, column=0, columnspan=2, sticky="ew"
-        )
+        # The instructions are hidden by default (more room for the graphs);
+        # the Help button in the bottom bar shows/hides them.
+        self.help_label = ttk.Label(win, text=self.HELP, wraplength=1120, padding=(10, 8))
+        self.help_label.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.help_label.grid_remove()
+        self._help_shown = False
+        win.bind("<Configure>", self._resize_help, add="+")
 
         # --- channel list ------------------------------------------------- #
         left = ttk.Frame(win, padding=(10, 0, 4, 0))
         left.grid(row=1, column=0, sticky="ns")
-        ttk.Label(left, text="Channel   (P = peaks, T = troughs, * = edited)").pack(anchor="w")
+        ttk.Label(left, text="Channel  (P peaks, T troughs, * edited, D detrend changed)").pack(
+            anchor="w"
+        )
         list_frame = ttk.Frame(left)
         list_frame.pack(fill="y", expand=True)
         self.listbox = tk.Listbox(list_frame, width=26, height=30, exportselection=False)
@@ -2315,10 +2568,56 @@ class ReviewWindow:
             side="left", padx=(4, 0)
         )
 
-        self.fig = Figure(figsize=(8, 7.2), dpi=100)
-        grid = self.fig.add_gridspec(2, 1, height_ratios=[1.0, 1.15])
-        self.ax = self.fig.add_subplot(grid[0])
-        self.ax_act = self.fig.add_subplot(grid[1])
+        # --- detrending of the current channel ------------------------------- #
+        self.method_var = tk.StringVar()
+        self.window_var = tk.StringVar()
+        self.cutoff_var = tk.StringVar()
+        self.order_var = tk.StringVar()
+        det = ttk.Frame(centre)
+        det.pack(fill="x", pady=(0, 4))
+        ttk.Label(det, text="Detrend (this channel):").pack(side="left", padx=(0, 4))
+        self.method_box = ttk.Combobox(
+            det, textvariable=self.method_var, values=list(DETREND_METHODS),
+            state="readonly", width=14,
+        )
+        self.method_box.pack(side="left")
+        self.method_box.bind("<<ComboboxSelected>>", self._update_detrend_widgets)
+        ttk.Label(det, text="Window (h)").pack(side="left", padx=(10, 2))
+        self.window_spin = ttk.Spinbox(
+            det, from_=0, to=DETREND_MAX_HOURS, increment=1, textvariable=self.window_var, width=6,
+            justify="right",
+        )
+        self.window_spin.pack(side="left")
+        ttk.Label(det, text="Cutoff period (h)").pack(side="left", padx=(10, 2))
+        self.cutoff_spin = ttk.Spinbox(
+            det, from_=0, to=DETREND_MAX_HOURS, increment=1, textvariable=self.cutoff_var, width=6,
+            justify="right",
+        )
+        self.cutoff_spin.pack(side="left")
+        ttk.Label(det, text="Order").pack(side="left", padx=(10, 2))
+        self.order_spin = ttk.Spinbox(
+            det, from_=3, to=2001, increment=2, textvariable=self.order_var, width=5,
+            justify="right",
+        )
+        self.order_spin.pack(side="left")
+        ttk.Button(det, text="Apply", command=lambda: self._apply_detrend(False)).pack(
+            side="left", padx=(10, 0)
+        )
+        ttk.Button(det, text="Apply to all", command=lambda: self._apply_detrend(True)).pack(
+            side="left", padx=(4, 0)
+        )
+        ttk.Button(det, text="Default", command=self._detrend_default).pack(
+            side="left", padx=(4, 0)
+        )
+        self._entry_widgets = (
+            self.period_spin, self.window_spin, self.cutoff_spin, self.order_spin, self.method_box,
+        )
+
+        self.fig = Figure(figsize=(8, 8.4), dpi=100)
+        grid = self.fig.add_gridspec(3, 1, height_ratios=[0.75, 1.0, 1.15])
+        self.ax_raw = self.fig.add_subplot(grid[0])
+        self.ax = self.fig.add_subplot(grid[1])
+        self.ax_act = self.fig.add_subplot(grid[2])
         self.canvas = FigureCanvasTkAgg(self.fig, master=centre)
         self.toolbar = NavigationToolbar2Tk(self.canvas, centre, pack_toolbar=False)
         self.toolbar.pack(side="bottom", fill="x")
@@ -2334,6 +2633,9 @@ class ReviewWindow:
         # --- bottom bar ------------------------------------------------------ #
         bottom = ttk.Frame(win, padding=10)
         bottom.grid(row=2, column=0, columnspan=2, sticky="ew")
+        ttk.Button(bottom, text="Help", width=6, command=self._toggle_help).pack(
+            side="left", padx=(0, 10)
+        )
         ttk.Label(bottom, textvariable=self.status_var).pack(side="left")
         ttk.Button(bottom, text="OK \u2013 export files", command=self._ok).pack(side="right")
         ttk.Button(bottom, text="Cancel", command=self._cancel).pack(side="right", padx=6)
@@ -2367,6 +2669,18 @@ class ReviewWindow:
     def day_length(self, value: float) -> None:
         self.periods[self.channel] = value
 
+    def _toggle_help(self) -> None:
+        self._help_shown = not self._help_shown
+        if self._help_shown:
+            self.help_label.grid()
+        else:
+            self.help_label.grid_remove()
+
+    def _resize_help(self, event) -> None:
+        """Keep the instructions wrapped to the window width."""
+        if event.widget is self.win:
+            self.help_label.configure(wraplength=max(300, event.width - 30))
+
     def _all_selected(self) -> dict:
         return {ch: (set(p), set(t)) for ch, (p, t) in self.selection.items()}
 
@@ -2396,6 +2710,8 @@ class ReviewWindow:
     def _list_text(self, channel: str) -> str:
         peaks, troughs = self.selection[channel]
         mark = "  *" if self._is_edited(channel) else ""
+        if not self.params[channel].same_as(self.default_params):
+            mark += "  D"
         return f"Ch {channel}    P {len(peaks)}   T {len(troughs)}{mark}"
 
     def _refresh_list_item(self, channel: str) -> None:
@@ -2414,7 +2730,7 @@ class ReviewWindow:
 
     def _key_step(self, delta: int) -> None:
         # Left/Right must keep moving the cursor while the period box is being edited.
-        if self.win.focus_get() is self.period_spin:
+        if self.win.focus_get() in self._entry_widgets:
             return
         self._step(delta)
 
@@ -2461,12 +2777,130 @@ class ReviewWindow:
         ax.set_xlim(x_min, x_max)
         ax.xaxis.set_major_locator(MultipleLocator(HOURS_PER_DAY))
         ax.set_autoscale_on(False)  # keep the view fixed while markers change
+        self._draw_raw_trend(x_min, x_max)
+        self._load_detrend_widgets()
         self.period_var.set(f"{self.day_length:g}")  # each channel has its own period
         self.fig.tight_layout()
         self.toolbar.update()  # forget the previous channel's zoom history
         self._draw_markers()
         self._draw_actogram_preview()
         self.status_var.set(f"Channel {channel}")
+
+    def _draw_raw_trend(self, x_min: float, x_max: float) -> None:
+        """Top plot: raw data with the trend line of the current channel."""
+        channel = self.channel
+        ax = self.ax_raw
+        ax.clear()
+        ax.scatter(self.raw["Hours"], self.raw[channel], s=2.5, c="violet", label="Bioluminescence")
+        ax.plot(
+            self.trend_cols["Hours"], self.trend_cols[channel], "-r", linewidth=1.0,
+            label=f"Trend line ({self.trend_labels[channel]})",
+        )
+        ax.grid(True, linewidth=0.5, color="lightgray", linestyle="--")
+        ax.set_xlim(x_min, x_max)
+        ax.xaxis.set_major_locator(MultipleLocator(HOURS_PER_DAY))
+        ax.set_ylim(0, upper_ylimit(self.raw[channel]))
+        ax.set_ylabel("Bioluminescence")
+        ax.legend(loc="upper right", fontsize=7, framealpha=0.6)
+        ax.set_navigate(False)  # zoom/pan applies to the detrended plot only
+
+    # ------------------------------------------------------------------ #
+    # Detrending (per channel)
+    # ------------------------------------------------------------------ #
+
+    def _load_detrend_widgets(self) -> None:
+        p = self.params[self.channel]
+        self.method_var.set(p.method)
+        self.window_var.set(f"{p.window_hours:g}")
+        self.cutoff_var.set(f"{p.cutoff_period_hours:g}")
+        self.order_var.set(str(int(p.order)))
+        self._update_detrend_widgets()
+
+    def _update_detrend_widgets(self, _event=None) -> None:
+        moving = self.method_var.get() == "Moving Average"
+        self.window_spin.configure(state="normal" if moving else "disabled")
+        for widget in (self.cutoff_spin, self.order_spin):
+            widget.configure(state="disabled" if moving else "normal")
+
+    def _read_detrend_widgets(self) -> DetrendParams | None:
+        """The parameters typed in; only the boxes of the chosen method are read."""
+        method = self.method_var.get()
+        base = self.params[self.channel]
+        try:
+            moving = method == "Moving Average"
+            params = DetrendParams(
+                method=method,
+                window_hours=float(self.window_var.get()) if moving else base.window_hours,
+                cutoff_period_hours=(
+                    base.cutoff_period_hours if moving else float(self.cutoff_var.get())
+                ),
+                order=int(base.order if moving else float(self.order_var.get())),
+            )
+        except (ValueError, tk.TclError):
+            self.status_var.set("The detrend parameters must be numbers.")
+            return None
+        error = check_detrend_params(params, self.time_interval, len(self.raw))
+        if error:
+            self.status_var.set(error)
+            return None
+        return params
+
+    def _has_edits(self, channel: str) -> bool:
+        peaks, troughs = self.selection[channel]
+        return self._is_edited(channel) or self.reg_sel[channel] != (set(peaks), set(troughs))
+
+    def _recompute_channel(self, channel: str, params: DetrendParams) -> None:
+        """New trend / detrended data for one channel; peaks are detected afresh."""
+        trend, label = channel_trend(self.raw, channel, params, self.time_interval)
+        detrended = self.raw[channel] - trend
+        self.trend_cols[channel] = trend
+        self.data[channel] = detrended
+        self.smooth[channel] = smooth_series(detrended, 9)
+        self.trend_labels[channel] = label
+        self.params[channel] = params
+        peaks, troughs = find_peaks_and_troughs(
+            self.smooth[channel], PEAK_MIN_SEPARATION_HOURS, self.time_interval
+        )
+        auto = ([int(i) for i in peaks], [int(i) for i in troughs])
+        self.auto[channel] = auto
+        self.selection[channel] = (list(auto[0]), list(auto[1]))
+        self.reg_sel[channel] = (set(auto[0]), set(auto[1]))
+
+    def _apply_detrend(self, all_channels: bool) -> None:
+        params = self._read_detrend_widgets()
+        if params is None:
+            return
+        targets = CHANNELS if all_channels else [self.channel]
+        changed = [ch for ch in targets if not self.params[ch].same_as(params)]
+        if not changed:
+            self.status_var.set("These detrend settings are already in use.")
+            return
+        edited = [ch for ch in changed if self._has_edits(ch)]
+        if edited and not messagebox.askyesno(
+            APP_TITLE,
+            "Changing the detrending re-detects the peaks and troughs, so the hand edits "
+            f"in {len(edited)} channel(s) ({', '.join(edited[:8])}"
+            f"{', ...' if len(edited) > 8 else ''}) will be discarded.\n\nContinue?",
+            parent=self.win,
+        ):
+            return
+        for channel in changed:
+            self._recompute_channel(channel, params)
+            self._refresh_list_item(channel)
+        self._draw_full()
+        self.status_var.set(
+            f"Detrending set to {params.describe()} for "
+            + (f"{len(changed)} channels." if len(changed) > 1 else f"channel {changed[0]}.")
+        )
+
+    def _detrend_default(self) -> None:
+        d = self.default_params
+        self.method_var.set(d.method)
+        self.window_var.set(f"{d.window_hours:g}")
+        self.cutoff_var.set(f"{d.cutoff_period_hours:g}")
+        self.order_var.set(str(int(d.order)))
+        self._update_detrend_widgets()
+        self._apply_detrend(False)
 
     def _draw_markers(self) -> None:
         for artist in self._marker_artists:
@@ -2778,6 +3212,7 @@ class ReviewWindow:
                 path, self.selection, self.smooth["Hours"], self.analysis.input_path.name,
                 reg_selection={ch: self._used(ch) for ch in CHANNELS},
                 actogram_period=self.periods,
+                detrend_params=self.params,
             )
         except OSError as error:
             messagebox.showerror(APP_TITLE, f"Could not save the file: {error}", parent=self.win)
@@ -2793,12 +3228,18 @@ class ReviewWindow:
         if not path:
             return
         try:
-            loaded, skipped, loaded_reg, loaded_period = load_peaks_json(
+            loaded, skipped, loaded_reg, loaded_period, loaded_detrend = load_peaks_json(
                 path, self.smooth["Hours"]
             )
         except (OSError, ValueError) as error:
             messagebox.showerror(APP_TITLE, f"Could not load the file: {error}", parent=self.win)
             return
+        skipped_detrend = 0
+        for channel, params in (loaded_detrend or {}).items():
+            if check_detrend_params(params, self.time_interval, len(self.raw)):
+                skipped_detrend += 1
+            elif not self.params[channel].same_as(params):
+                self._recompute_channel(channel, params)  # peaks come from the file below
         self.selection.update(loaded)
         for channel, (peaks, troughs) in loaded.items():
             self.reg_sel[channel] = (set(peaks), set(troughs))  # default: use everything
@@ -2811,9 +3252,10 @@ class ReviewWindow:
             self.period_var.set(f"{self.day_length:g}")
         for channel in CHANNELS:
             self._refresh_list_item(channel)
-        self._draw_markers()
-        self._draw_actogram_preview()
+        self._draw_full()
         note = f" ({skipped} time points did not match this recording and were skipped)" if skipped else ""
+        if skipped_detrend:
+            note += f" ({skipped_detrend} detrend settings were not usable and were ignored)"
         self.status_var.set(f"Loaded: {Path(path).name}{note}")
 
     def _close(self) -> None:
@@ -2830,7 +3272,7 @@ class ReviewWindow:
         reg_selection = {ch: self._used(ch) for ch in CHANNELS}
         period = dict(self.periods)
         self._close()
-        self.on_ok(selection, reg_selection, period)
+        self.on_ok(selection, reg_selection, period, dict(self.params))
 
     def _cancel(self) -> None:
         self._close()
