@@ -2434,6 +2434,10 @@ class ReviewWindow:
 
     HIT_RADIUS_PX = 25     # how close (in pixels) a click must be to grab a marker
     DRAG_THRESHOLD_PX = 6  # movement below this counts as a click, not a drag
+    ZOOM_WINDOW_HOURS = 24.0     # width of the view when zooming onto one peak/trough
+    ZOOM_MIN_WIDTH_HOURS = 2.0   # the view is never narrower than this
+    WHEEL_ZOOM_FACTOR = 0.85     # view width is multiplied by this per wheel step (in)
+    WHEEL_PAN_FRACTION = 0.15    # Shift+wheel scrolls by this fraction of the view
 
     HELP = (
         "Top plot: choose 'Remove' and click a marker to delete it; choose 'Add peak' / "
@@ -2441,7 +2445,14 @@ class ReviewWindow:
         "Actogram: click a point to use / not use it in the period-phase regression "
         "(ringed points are used); drag a box to select all points inside, right-drag to "
         "deselect them.   The actogram period (default 24 h) is set separately for each "
-        "channel and is used for that channel's page in the PDF.   While a zoom/pan tool of the toolbar is active, clicks do not edit "
+        "channel and is used for that channel's page in the PDF.   "
+        "Zooming the middle plot with the mouse: the wheel zooms in/out around the pointer, "
+        "Shift+wheel scrolls in time, right-click zooms onto the nearest peak/trough, "
+        "right-drag pans, middle-click or right double-click returns to the full view, and a "
+        "click in the raw-data plot moves the zoomed view to that time (the shaded band "
+        "there shows where you are).   'Prev/Next marker' (or the , and . keys) step through "
+        "the peaks and troughs one by one; Esc shows the full view.   "
+        "While a zoom/pan tool of the toolbar is active, clicks do not edit "
         "anything.   Detrending (bottom of the controls) is chosen per channel: pick the method "
         "and parameters and press Apply; the trend, the detrended curve and the automatic "
         "peaks/troughs of that channel are recalculated (hand edits of the channel are "
@@ -2477,6 +2488,11 @@ class ReviewWindow:
         self._marker_artists: list = []
         self._drag: dict | None = None
         self._drag_patch = None
+        self._pan: dict | None = None        # right-button drag in the middle plot
+        self._focus_row: int | None = None   # peak/trough the zoomed view was centred on
+        self._view_span = None               # shaded band in the raw plot
+        self._full_xlim = (0.0, 1.0)
+        self._full_ylim = (0.0, 1.0)
         self._closed = False
 
         win = self.win = tk.Toplevel(parent)
@@ -2541,6 +2557,25 @@ class ReviewWindow:
         ttk.Button(controls, text="Reset this channel", command=self._reset_channel).pack(
             side="right", padx=(0, 12)
         )
+
+        zoom = ttk.Frame(centre)
+        zoom.pack(fill="x", pady=(0, 4))
+        ttk.Label(zoom, text="Zoom:").pack(side="left", padx=(0, 6))
+        ttk.Button(
+            zoom, text="\u25c0 Prev marker", command=lambda: self._jump_marker(-1)
+        ).pack(side="left")
+        ttk.Button(
+            zoom, text="Next marker \u25b6", command=lambda: self._jump_marker(1)
+        ).pack(side="left", padx=(4, 0))
+        ttk.Button(zoom, text="Full view", command=self._full_view).pack(
+            side="left", padx=(4, 0)
+        )
+        ttk.Label(
+            zoom,
+            text="wheel: zoom   Shift+wheel: scroll   right-click: zoom to marker   "
+                 "right-drag: pan   middle-click: full view",
+            foreground="gray40",
+        ).pack(side="left", padx=(12, 0))
 
         acto = ttk.Frame(centre)
         acto.pack(fill="x", pady=(0, 4))
@@ -2619,7 +2654,13 @@ class ReviewWindow:
         self.ax = self.fig.add_subplot(grid[1])
         self.ax_act = self.fig.add_subplot(grid[2])
         self.canvas = FigureCanvasTkAgg(self.fig, master=centre)
-        self.toolbar = NavigationToolbar2Tk(self.canvas, centre, pack_toolbar=False)
+        review = self
+
+        class _Toolbar(NavigationToolbar2Tk):
+            def home(self, *args):  # Home button: full view of the middle plot
+                review._full_view()
+
+        self.toolbar = _Toolbar(self.canvas, centre, pack_toolbar=False)
         self.toolbar.pack(side="bottom", fill="x")
         ttk.Label(centre, textvariable=self.reg_var, justify="left", padding=(2, 4)).pack(
             side="bottom", fill="x"
@@ -2629,6 +2670,10 @@ class ReviewWindow:
         self.canvas.mpl_connect("button_press_event", self._on_act_press)
         self.canvas.mpl_connect("motion_notify_event", self._on_act_motion)
         self.canvas.mpl_connect("button_release_event", self._on_act_release)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll)
+        self.canvas.mpl_connect("button_press_event", self._on_zoom_press)
+        self.canvas.mpl_connect("motion_notify_event", self._on_zoom_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_zoom_release)
 
         # --- bottom bar ------------------------------------------------------ #
         bottom = ttk.Frame(win, padding=10)
@@ -2647,6 +2692,9 @@ class ReviewWindow:
 
         win.bind("<Left>", lambda _e: self._key_step(-1))
         win.bind("<Right>", lambda _e: self._key_step(1))
+        win.bind("<comma>", lambda _e: self._key_zoom(lambda: self._jump_marker(-1)))
+        win.bind("<period>", lambda _e: self._key_zoom(lambda: self._jump_marker(1)))
+        win.bind("<Escape>", lambda _e: self._key_zoom(self._full_view))
 
         self._draw_full()
         try:  # make the window modal; harmless if the platform refuses
@@ -2777,7 +2825,14 @@ class ReviewWindow:
         ax.set_xlim(x_min, x_max)
         ax.xaxis.set_major_locator(MultipleLocator(HOURS_PER_DAY))
         ax.set_autoscale_on(False)  # keep the view fixed while markers change
+        self._full_xlim = (x_min, x_max)
+        self._full_ylim = ax.get_ylim()
+        self._focus_row = None
+        self._pan = None
         self._draw_raw_trend(x_min, x_max)
+        # ax.clear() dropped earlier callbacks; follow every x change (ours or the toolbar's)
+        ax.callbacks.connect("xlim_changed", self._on_view_changed)
+        self._on_view_changed(ax)
         self._load_detrend_widgets()
         self.period_var.set(f"{self.day_length:g}")  # each channel has its own period
         self.fig.tight_layout()
@@ -2804,6 +2859,7 @@ class ReviewWindow:
         ax.set_ylabel("Bioluminescence")
         ax.legend(loc="upper right", fontsize=7, framealpha=0.6)
         ax.set_navigate(False)  # zoom/pan applies to the detrended plot only
+        self._view_span = None  # ax.clear() above discarded the band
 
     # ------------------------------------------------------------------ #
     # Detrending (per channel)
@@ -2913,8 +2969,6 @@ class ReviewWindow:
         ax = self.ax
         channel = self.channel
         peaks, troughs = self.selection[channel]
-        low, high = ax.get_ylim()
-        span = high - low
         for indices, color, name, sign, va in (
             (peaks, "red", "Peaks", 1, "bottom"),
             (troughs, "blue", "Troughs", -1, "top"),
@@ -2927,12 +2981,23 @@ class ReviewWindow:
                 ax.scatter(hours, values, marker="o", s=45, color=color, zorder=5, label=name)
             )
             for hour, value in zip(hours, values):
+                # offset in points, so the labels stay put at any zoom level
                 self._marker_artists.append(
-                    ax.text(
-                        hour, value + sign * span * 0.03, f"{hour:.2f} h",
-                        fontsize=7, color=color, ha="center", va=va, clip_on=True,
+                    ax.annotate(
+                        f"{hour:.2f} h", (hour, value), xytext=(0, sign * 6),
+                        textcoords="offset points", fontsize=7, color=color,
+                        ha="center", va=va, annotation_clip=True, clip_on=True,
                     )
                 )
+        focus = self._focus_row
+        if focus is not None and (focus in peaks or focus in troughs):
+            self._marker_artists.append(
+                ax.scatter(
+                    [self.smooth.loc[focus, "Hours"]], [self.smooth.loc[focus, channel]],
+                    marker="o", s=220, facecolors="none", edgecolors="darkorange",
+                    linewidths=2.0, zorder=6,
+                )
+            )
         # No legend here: the colours are self-explanatory and the PDF has the legend.
 
     def _draw_actogram_preview(self) -> None:
@@ -3078,6 +3143,212 @@ class ReviewWindow:
         self._draw_markers()
         self._draw_actogram_preview()
         self.status_var.set("All channels reset to the automatic detection.")
+
+    # ------------------------------------------------------------------ #
+    # Zooming the middle plot with the mouse
+    # ------------------------------------------------------------------ #
+
+    def _key_zoom(self, action) -> None:
+        # Typing in the entry boxes must not move the view.
+        if self.win.focus_get() in self._entry_widgets:
+            return
+        action()
+
+    def _is_full_view(self) -> bool:
+        x0, x1 = self.ax.get_xlim()
+        full0, full1 = self._full_xlim
+        return (x1 - x0) >= (full1 - full0) * 0.999
+
+    @staticmethod
+    def _tick_step(span: float) -> float:
+        """Major tick spacing: 24 h in the full view, finer when zoomed in."""
+        for step in (HOURS_PER_DAY, 12.0, 6.0, 4.0, 2.0, 1.0):
+            if span / step >= 4:
+                return step
+        return 0.5
+
+    def _on_view_changed(self, ax) -> None:
+        """x range of the middle plot changed: adapt the ticks, move the band in the raw plot."""
+        x0, x1 = ax.get_xlim()
+        ax.xaxis.set_major_locator(MultipleLocator(self._tick_step(x1 - x0)))
+        if self._view_span is not None:
+            try:
+                self._view_span.remove()
+            except (NotImplementedError, ValueError):
+                pass
+            self._view_span = None
+        if not self._is_full_view():
+            self._view_span = self.ax_raw.axvspan(
+                x0, x1, facecolor="gold", edgecolor="darkorange", alpha=0.3, zorder=0.5
+            )
+
+    def _fit_y(self, x0: float, x1: float) -> None:
+        """Fit the y range to the data inside [x0, x1] (room left for the labels)."""
+        channel = self.channel
+        values = []
+        for frame in (self.data, self.smooth):
+            inside = (frame["Hours"] >= x0) & (frame["Hours"] <= x1)
+            column = frame.loc[inside, channel].to_numpy(dtype=float)
+            values.append(column[np.isfinite(column)])
+        values = np.concatenate(values)
+        if values.size == 0:
+            return
+        low, high = float(values.min()), float(values.max())
+        span = high - low
+        if span <= 0:
+            span = abs(high) or 1.0
+        self.ax.set_ylim(low - span * 0.15, high + span * 0.15)
+
+    def _set_view(self, x0: float, x1: float, fit_y: bool = True) -> None:
+        """Show [x0, x1] in the middle plot, kept inside the recording."""
+        full0, full1 = self._full_xlim
+        full_width = full1 - full0
+        min_width = min(full_width, max(self.ZOOM_MIN_WIDTH_HOURS, 10 * self.time_interval))
+        width = min(max(x1 - x0, min_width), full_width)
+        if width >= full_width * 0.999:
+            x0, x1 = full0, full1
+        else:
+            x0 = min(max(x0, full0), full1 - width)
+            x1 = x0 + width
+        self.ax.set_xlim(x0, x1)
+        if x0 == full0 and x1 == full1:
+            self.ax.set_ylim(*self._full_ylim)
+        elif fit_y:
+            self._fit_y(x0, x1)
+        self.canvas.draw_idle()
+
+    def _zoom_width(self) -> float:
+        """Width for zooming onto a point: the current one if already zoomed further in."""
+        x0, x1 = self.ax.get_xlim()
+        return min(x1 - x0, self.ZOOM_WINDOW_HOURS)
+
+    def _centre_on(self, hour: float, focus_row: int | None = None) -> None:
+        width = self._zoom_width()
+        if focus_row != self._focus_row:
+            self._focus_row = focus_row
+            self._draw_markers()
+        self._set_view(hour - width / 2, hour + width / 2)
+
+    def _full_view(self) -> None:
+        self._focus_row = None
+        self._draw_markers()
+        self._set_view(*self._full_xlim)
+        self.status_var.set(f"Channel {self.channel}: full view.")
+
+    def _sorted_markers(self) -> list:
+        """All peaks and troughs of the current channel in time order: (hour, kind, row)."""
+        peaks, troughs = self.selection[self.channel]
+        markers = [(float(self.smooth.loc[i, "Hours"]), "peak", i) for i in peaks]
+        markers += [(float(self.smooth.loc[i, "Hours"]), "trough", i) for i in troughs]
+        return sorted(markers)
+
+    def _jump_marker(self, delta: int) -> None:
+        """Zoom onto the next (delta=1) or previous (delta=-1) peak/trough."""
+        markers = self._sorted_markers()
+        if not markers:
+            self.status_var.set("There are no peaks or troughs in this channel.")
+            return
+        x0, x1 = self.ax.get_xlim()
+        rows = [row for _h, _k, row in markers]
+        if self._is_full_view():
+            i = 0 if delta > 0 else len(markers) - 1
+        elif self._focus_row in rows and x0 <= self.smooth.loc[self._focus_row, "Hours"] <= x1:
+            i = rows.index(self._focus_row) + delta
+        else:  # continue from the middle of the current view
+            centre = (x0 + x1) / 2
+            if delta > 0:
+                i = next((k for k, m in enumerate(markers) if m[0] > centre + 1e-9), len(markers))
+            else:
+                i = next(
+                    (k for k in range(len(markers) - 1, -1, -1) if markers[k][0] < centre - 1e-9),
+                    -1,
+                )
+        if not 0 <= i < len(markers):
+            self.status_var.set(
+                "This is the last peak/trough." if delta > 0 else "This is the first peak/trough."
+            )
+            return
+        hour, kind, row = markers[i]
+        self._centre_on(hour, row)
+        self.status_var.set(f"{kind.capitalize()} at {hour:.2f} h  ({i + 1} of {len(markers)})")
+
+    def _on_scroll(self, event) -> None:
+        if event.inaxes is not self.ax or event.xdata is None:
+            return
+        state = getattr(getattr(event, "guiEvent", None), "state", 0)
+        shift = (isinstance(state, int) and state & 0x0001) or "shift" in (event.key or "")
+        x0, x1 = self.ax.get_xlim()
+        width = x1 - x0
+        if shift:  # scroll in time
+            shift_by = -event.step * self.WHEEL_PAN_FRACTION * width
+            self._set_view(x0 + shift_by, x1 + shift_by)
+            return
+        scale = self.WHEEL_ZOOM_FACTOR ** event.step
+        anchor = event.xdata  # the time under the pointer stays where it is
+        self._set_view(anchor - (anchor - x0) * scale, anchor + (x1 - anchor) * scale)
+
+    def _nearest_marker(self, pixel_x: float, pixel_y: float, radius: float):
+        markers = self._sorted_markers()
+        if not markers:
+            return None
+        points = np.array(
+            [(hour, self.smooth.loc[row, self.channel]) for hour, _k, row in markers], dtype=float
+        )
+        pixels = self.ax.transData.transform(points)
+        distances = np.hypot(pixels[:, 0] - pixel_x, pixels[:, 1] - pixel_y)
+        nearest = int(np.argmin(distances))
+        return markers[nearest] if distances[nearest] <= radius else None
+
+    def _on_zoom_press(self, event) -> None:
+        if self._toolbar_active() or event.xdata is None:
+            return
+        if event.inaxes is self.ax_raw and event.button == 1:
+            # the raw plot works as an overview: jump there
+            self._centre_on(event.xdata)
+            self.status_var.set(f"View moved to {event.xdata:.1f} h.")
+            return
+        if event.inaxes is not self.ax:
+            return
+        if event.button == 2 or (event.button == 3 and event.dblclick):
+            self._pan = None
+            self._full_view()
+        elif event.button == 3:
+            self._pan = {"px": event.x, "py": event.y, "xlim": self.ax.get_xlim(), "moved": False}
+
+    def _on_zoom_motion(self, event) -> None:
+        pan = self._pan
+        if pan is None or event.x is None:
+            return
+        if not pan["moved"] and abs(event.x - pan["px"]) < self.DRAG_THRESHOLD_PX:
+            return
+        pan["moved"] = True
+        x0, x1 = pan["xlim"]
+        hours_per_pixel = (x1 - x0) / max(self.ax.bbox.width, 1.0)
+        shift_by = -(event.x - pan["px"]) * hours_per_pixel
+        self._set_view(x0 + shift_by, x1 + shift_by, fit_y=False)
+
+    def _on_zoom_release(self, event) -> None:
+        pan, self._pan = self._pan, None
+        if pan is None:
+            return
+        if pan["moved"]:
+            x0, x1 = self.ax.get_xlim()
+            self._set_view(x0, x1)  # fit the y range to what is now visible
+            return
+        # a right-click without dragging: zoom onto the nearest peak/trough
+        marker = self._nearest_marker(pan["px"], pan["py"], self.HIT_RADIUS_PX * 3)
+        if marker is None:
+            x = self.ax.transData.inverted().transform((pan["px"], 0))[0]
+            self._centre_on(x)
+            self.status_var.set(f"Zoomed in at {x:.1f} h.")
+            return
+        hour, kind, row = marker
+        self._centre_on(hour, row)
+        markers = self._sorted_markers()
+        self.status_var.set(
+            f"{kind.capitalize()} at {hour:.2f} h  "
+            f"({markers.index(marker) + 1} of {len(markers)})"
+        )
 
     # ------------------------------------------------------------------ #
     # Choosing the regression points in the actogram
