@@ -13,6 +13,11 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # The Windows runner's console uses cp1252, which cannot print characters
+      # such as the arrow in the app title; make Python use UTF-8 everywhere.
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
 
     steps:
       - name: Check out the code
@@ -31,7 +36,7 @@ jobs:
           pip install -r requirements.txt "pyinstaller>=6.6"
 
       - name: Check that the program loads
-        run: python -c "import ttron2excel_app as app; print(app.APP_TITLE)"
+        run: python -c "import ttron2excel_app as app; print('Loaded OK:', ascii(app.APP_TITLE))"
 
       - name: Build the EXE
         run: pyinstaller --noconfirm --clean ttron2excel.spec
