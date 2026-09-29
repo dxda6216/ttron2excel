@@ -757,6 +757,7 @@ def save_peaks_json(
     reg_selection: RegSelection | None = None,
     actogram_period=None,
     detrend_params: dict | None = None,
+    fit_options: dict | None = None,
 ) -> None:
     """Save the peak/trough selection (by time, so it survives re-processing).
 
@@ -784,6 +785,8 @@ def save_peaks_json(
                 "cutoff_period_hours": float(p.cutoff_period_hours),
                 "order": int(p.order),
             }
+        if fit_options is not None and channel in fit_options:
+            entry["sine_fit"] = dict(fit_options[channel])
         channels[channel] = entry
     payload = {
         "format": PEAKS_JSON_FORMAT,
@@ -859,6 +862,24 @@ def load_peaks_json(path, hours: pd.Series):
             except (TypeError, ValueError):
                 pass
     return result, skipped, (regression or None), (periods or None), (detrend_params or None)
+
+
+def load_fit_options_json(path) -> dict:
+    """Per-channel sine-fit options stored in a peaks JSON file ({} if none/invalid)."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    options = {}
+    for channel, entry in (payload.get("channels") or {}).items():
+        if channel in CHANNELS and isinstance(entry, dict) and isinstance(
+            entry.get("sine_fit"), dict
+        ):
+            try:
+                options[channel] = check_fit_options(entry["sine_fit"])
+            except (KeyError, TypeError, ValueError):
+                pass
+    return options
 
 
 # --------------------------------------------------------------------------- #
@@ -985,6 +1006,10 @@ CHANNEL_PAGE_RC = {
     "legend.fontsize": 6,
     "figure.titlesize": 12,
 }
+
+MOVING_AVERAGE_COLOR = "limegreen"   # light green: 9-point moving average (detrended graphs)
+SINE_FIT_COLOR = "deepskyblue"       # light blue: sine-fit line (detrended graphs)
+PDF_LEGEND_FONTSIZE = 5.5   # legends to the right of the graphs on the channel pages
 
 FIT_PAGE_RC = {
     "font.size": 8,
@@ -1232,14 +1257,25 @@ def plot_channel_page(
     peaks_troughs: tuple | None = None,
     reg_selection: tuple | None = None,
     regression: dict | None = None,
+    fit_detail: dict | None = None,
 ) -> None:
-    """One page per channel: raw + trend, detrended + peaks, actogram."""
+    """One page per channel: raw + trend, detrended + peaks (+ sine fit), actogram.
+
+    The legends sit to the right of the graphs (small font, wrapped labels); the
+    box under the actogram holds the regression results and, on its third line,
+    the sine-fit result (`fit_detail` = fit_one_channel() result).
+    """
     with plt.rc_context(CHANNEL_PAGE_RC):
         figure = plt.figure(figsize=(8.5, 11))
         figure.suptitle(f"{experiment_number}   Ch # {channel}", fontsize=12)
+        # Fixed margins keep the three graphs aligned; the right margin holds the legends.
+        grid = figure.add_gridspec(
+            3, 1, left=0.10, right=0.80, top=0.94, bottom=0.14, hspace=0.36,
+            height_ratios=[1.0, 1.0, 1.15],
+        )
 
         # --- raw data with its trend line ---------------------------------- #
-        ax_raw = figure.add_subplot(3, 1, 1)
+        ax_raw = figure.add_subplot(grid[0])
         ax_raw.scatter(
             raw["Hours"], raw[channel], s=3.0, c="violet", label="Bioluminescence"
         )
@@ -1251,18 +1287,32 @@ def plot_channel_page(
         ax_raw.set_ylim(0, upper_ylimit(raw[channel]))
         ax_raw.set_xlabel("Hours", fontsize=10)
         ax_raw.set_ylabel("Bioluminescence", fontsize=10)
-        ax_raw.legend(loc="upper right", fontsize=5)
+        outside_legend(ax_raw, fontsize=PDF_LEGEND_FONTSIZE)
 
         # --- detrended data with peaks and troughs -------------------------- #
-        ax_detrended = figure.add_subplot(3, 1, 2)
+        ax_detrended = figure.add_subplot(grid[1])
         ax_detrended.scatter(
             detrended["Hours"], detrended[channel], s=3.0, c="violet",
             label="Detrended bioluminescence",
         )
         ax_detrended.plot(
-            detrended_smoothed["Hours"], detrended_smoothed[channel], "-b",
-            linewidth=1.0, label="Smoothed line (9-point moving average, centered)",
+            detrended_smoothed["Hours"], detrended_smoothed[channel], "-",
+            color=MOVING_AVERAGE_COLOR, linewidth=1.0, label="Smoothed line (9-point moving average, centered)",
         )
+        if fit_detail is not None and fit_detail["fit"] is not None:
+            fit_row = fit_detail["row"]
+            ax_detrended.plot(
+                fit_detail["times"], fit_curve(fit_detail["fit"], fit_detail["times"]), "-",
+                color=SINE_FIT_COLOR, linewidth=1.3, alpha=0.9, zorder=3,
+                label=("Damped sine fit" if fit_row["Model"] == "Damped sine"
+                       else "Sine fit (no damping)"),
+            )
+            for i, x in enumerate((fit_row["Fit Start (h)"], fit_row["Fit End (h)"])):
+                ax_detrended.axvline(
+                    x, color="darkgreen", linestyle=":", linewidth=1.0,
+                    label=f"Fit range ({fit_row['Fit Start (h)']:g}\u2013"
+                          f"{fit_row['Fit End (h)']:g} h)" if i == 0 else None,
+                )
 
         if peaks_troughs is None:
             peaks, troughs = find_peaks_and_troughs(
@@ -1294,30 +1344,53 @@ def plot_channel_page(
         axis.apply(ax_detrended)
         ax_detrended.set_xlabel("Hours", fontsize=10)
         ax_detrended.set_ylabel("Detrended bioluminescence", fontsize=10)
-        ax_detrended.legend(loc="upper right", fontsize=5)
+        outside_legend(ax_detrended, fontsize=PDF_LEGEND_FONTSIZE)
 
         # --- actogram ------------------------------------------------------- #
-        ax_actogram = figure.add_subplot(3, 1, 3)
-        summary = ""
+        ax_actogram = figure.add_subplot(grid[2])
+        lines = []
         if regression is not None and reg_selection is not None:
-            summary = regression_summary_text(
+            lines.append(regression_summary_text(
                 regression, len(reg_selection[0]), len(reg_selection[1])
-            )
+            ))
+        if fit_detail is not None:
+            lines.append(fit_summary_text(fit_detail["row"]))  # third line of the box
         _draw_actogram(
             ax_actogram, detrended_smoothed, peaks, troughs,
             day_length, last_hour, label_actogram,
-            selected=reg_selection, regression=regression, summary=summary,
+            selected=reg_selection, regression=regression,
         )
+        outside_legend(ax_actogram, fontsize=PDF_LEGEND_FONTSIZE)
+        if lines:
+            # centred on the page (not on the narrower graph) so long lines fit
+            from matplotlib.transforms import blended_transform_factory
 
-        figure.tight_layout(rect=(0, 0.02, 1, 0.98))
+            ax_actogram.text(
+                0.5, -0.22, "\n".join(lines),
+                transform=blended_transform_factory(figure.transFigure, ax_actogram.transAxes),
+                ha="center", va="top", fontsize=8, linespacing=1.5,
+                bbox={"boxstyle": "round,pad=0.4", "facecolor": "#f4f4f4", "edgecolor": "gray"},
+            )
+
         pdf.savefig(figure)
         plt.close(figure)
 
 
 # --------------------------------------------------------------------------- #
-# Damped sine fitting
+# Sine fitting (damped sine or plain sine; settings can be set per channel
+# in the review window)
 # --------------------------------------------------------------------------- #
 
+FIT_MODELS = ("Damped sine", "Sine (no damping)")
+FIT_DECAY_BOUNDS = (0.0, 0.5)       # 1/h, as in the original notebook
+FIT_MIN_R2 = 0.1                    # below this a fit is flagged as poor
+FIT_MIN_WINDOW_HOURS = 24.0         # shorter fitting windows cannot show a full cycle
+FIT_DEFAULT_WINDOW = (24.0, 120.0)  # used when the window in the settings is too short
+FIT_PERIOD_LIMITS = (1.0, 200.0)    # allowed range of the period search bounds
+FIT_OPTION_KEYS = ("fit_model", "fit_start_hour", "fit_end_hour", "fit_min_period",
+                   "fit_max_period")
+
+# The first six columns are those of the original workbook; the rest were added.
 FIT_COLUMNS = [
     "Channel",
     "Fitted Amplitude",
@@ -1325,34 +1398,231 @@ FIT_COLUMNS = [
     "Fitted Phase (radians)",
     "Fitted Decay Rate",
     "Fitted Offset",
+    "Model",
+    "Status",
+    "Fit Start (h)",
+    "Fit End (h)",
+    "N Points",
+    "Min Period (h)",
+    "Max Period (h)",
+    "Peak Phase (h)",
+    "R squared",
+    "RMSE",
 ]
 
 
 def damped_sine(t, amplitude, period, phase, decay_rate, offset):
+    """t = time since the start of the fitting window."""
     return amplitude * np.exp(-decay_rate * t) * np.sin(2 * np.pi * t / period + phase) + offset
 
 
-def _empty_fit(channel: str) -> dict:
-    return {"Channel": channel, **{column: np.nan for column in FIT_COLUMNS[1:]}}
+def plain_sine(t, amplitude, period, phase, offset):
+    return amplitude * np.sin(2 * np.pi * t / period + phase) + offset
 
 
-def fit_damped_sine(times: pd.Series, values: pd.Series) -> tuple[np.ndarray, float]:
-    """Fit the damped sine model. Returns the parameters and the normalized phase."""
-    amplitude_guess = (values.max() - values.min()) / 2.0
-    if amplitude_guess <= 0:
-        amplitude_guess = values.std() * 2
-    if not amplitude_guess:
-        amplitude_guess = 1.0
+def _periodogram_guesses(t, y, pmin: float, pmax: float, n_guesses: int = 3) -> list[float]:
+    """Best periods of a Lomb-Scargle periodogram within [pmin, pmax]."""
+    mid = float(np.clip(HOURS_PER_DAY, pmin, pmax))
+    periods = np.linspace(pmin, pmax, 400)
+    try:
+        power = signal.lombscargle(t, y - y.mean(), 2 * np.pi / periods)
+    except Exception:  # noqa: BLE001
+        return [mid]
+    peaks, _ = signal.find_peaks(power)
+    if len(peaks) == 0:
+        peaks = [int(np.argmax(power))]
+    best = sorted(peaks, key=lambda i: power[i], reverse=True)[:n_guesses]
+    guesses = [float(periods[i]) for i in best]
+    if all(abs(g - mid) > 1.0 for g in guesses):
+        guesses.append(mid)
+    return guesses
 
-    guesses = [amplitude_guess, HOURS_PER_DAY, 0.0, 0.01, values.mean()]
-    lower = [0, FIT_MIN_PERIOD_HOURS, -2 * np.pi, 0, -np.inf]
-    upper = [np.inf, FIT_MAX_PERIOD_HOURS, 2 * np.pi, 0.5, np.inf]
 
-    params, _ = curve_fit(
-        damped_sine, times, values, p0=guesses, bounds=(lower, upper), maxfev=10000
-    )
-    phase = float(params[2]) % (2 * np.pi)
-    return params, phase
+def _linear_sine(t, y, period: float):
+    """Least-squares amplitude, phase and offset for a fixed period."""
+    w = 2 * np.pi / period
+    design = np.column_stack([np.sin(w * t), np.cos(w * t), np.ones_like(t)])
+    (a, b, c), *_ = np.linalg.lstsq(design, y, rcond=None)
+    return float(np.hypot(a, b)), float(np.arctan2(b, a)), float(c)
+
+
+def fit_sine(times, values, model: str, pmin: float, pmax: float) -> dict:
+    """Fit one channel.  `times` are absolute hours.
+
+    The model uses t' = t - t0 (t0 = first fitted time), as the notebook did, so
+    the decay term, the amplitude and 'Fitted Phase (radians)' refer to the start
+    of the fitting window.  'Peak Phase (h)' is the time of a fitted peak modulo
+    the period, counted from 0 h (the convention of the peak-time regression).
+    Several starting values are tried (periodogram peaks plus the notebook's own
+    starting values) and the fit with the smallest residual is kept.
+    """
+    t_abs = np.asarray(times, dtype=float)
+    y = np.asarray(values, dtype=float)
+    t0 = float(t_abs.min())
+    t = t_abs - t0
+    damped = model == "Damped sine"
+    function = damped_sine if damped else plain_sine
+    spread = float(np.nanstd(y)) or 1.0
+
+    starts = []
+    for period_guess in _periodogram_guesses(t, y, pmin, pmax):
+        amplitude, phase, offset = _linear_sine(t, y, period_guess)
+        amplitude = max(amplitude, 1e-6 * spread)
+        if damped:
+            for decay in (0.0, 0.03):
+                starts.append([amplitude * (1 + decay * t.mean()), period_guess, phase, decay,
+                               offset])
+        else:
+            starts.append([amplitude, period_guess, phase, offset])
+    # the original notebook's starting values
+    amplitude0 = (y.max() - y.min()) / 2.0 or float(np.std(y)) * 2 or 1.0
+    period0 = float(np.clip(HOURS_PER_DAY, pmin, pmax))
+    starts.append([amplitude0, period0, 0.0, 0.01, float(y.mean())] if damped
+                  else [amplitude0, period0, 0.0, float(y.mean())])
+
+    if damped:
+        lower = [0, pmin, -4 * np.pi, FIT_DECAY_BOUNDS[0], -np.inf]
+        upper = [np.inf, pmax, 4 * np.pi, FIT_DECAY_BOUNDS[1], np.inf]
+    else:
+        lower = [0, pmin, -4 * np.pi, -np.inf]
+        upper = [np.inf, pmax, 4 * np.pi, np.inf]
+
+    best = None
+    for p0 in starts:
+        p0 = np.clip(np.asarray(p0, dtype=float), lower, upper)  # keep inside the bounds
+        try:
+            with np.errstate(over="ignore", invalid="ignore"):
+                params, _cov = curve_fit(function, t, y, p0=p0, bounds=(lower, upper),
+                                         maxfev=20000)
+        except (RuntimeError, ValueError):
+            continue
+        with np.errstate(over="ignore", invalid="ignore"):
+            sse = float(np.sum((y - function(t, *params)) ** 2))
+        if np.isfinite(sse) and (best is None or sse < best[0]):
+            best = (sse, params)
+    if best is None:
+        raise RuntimeError("the least-squares fit did not converge")
+
+    sse, params = best
+    if damped:
+        amplitude, period, phase, decay, offset = params
+    else:
+        amplitude, period, phase, offset = params
+        decay = 0.0
+    phase_rel = float(phase) % (2 * np.pi)
+    phase_abs = (phase - 2 * np.pi * t0 / period) % (2 * np.pi)
+    peak_time = (period * (0.25 - phase_abs / (2 * np.pi))) % period
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    return {
+        "params": params, "function": function, "t0": t0, "model": model,
+        "amplitude": float(amplitude), "period": float(period), "phase": phase_rel,
+        "decay": float(decay), "offset": float(offset), "peak_time": float(peak_time),
+        "r2": 1.0 - sse / ss_tot if ss_tot > 0 else np.nan,
+        "rmse": float(np.sqrt(sse / len(y))),
+    }
+
+
+def fit_curve(fit: dict, times) -> np.ndarray:
+    """The fitted curve at absolute times (hours)."""
+    t = np.asarray(times, dtype=float) - fit["t0"]
+    with np.errstate(over="ignore", invalid="ignore"):
+        return fit["function"](t, *fit["params"])
+
+
+def default_fit_options(s) -> dict:
+    """Sine-fit options from the main window's settings (too short a window: 24-120 h)."""
+    start, end = float(s.fit_start_hour), float(s.fit_end_hour)
+    if end - start < FIT_MIN_WINDOW_HOURS:
+        start, end = FIT_DEFAULT_WINDOW
+    return {"fit_model": FIT_MODELS[0], "fit_start_hour": start, "fit_end_hour": end,
+            "fit_min_period": FIT_MIN_PERIOD_HOURS, "fit_max_period": FIT_MAX_PERIOD_HOURS}
+
+
+def check_fit_options(options: dict) -> dict:
+    """Validate and normalise one channel's sine-fit options (raises ValueError)."""
+    model = options["fit_model"]
+    if model not in FIT_MODELS:
+        raise ValueError(f"Unknown fit model: {model}")
+    start, end = float(options["fit_start_hour"]), float(options["fit_end_hour"])
+    pmin, pmax = float(options["fit_min_period"]), float(options["fit_max_period"])
+    if not all(math.isfinite(v) for v in (start, end, pmin, pmax)):
+        raise ValueError("The fit settings must be numbers.")
+    if start < 0:
+        raise ValueError("'Fit from' cannot be negative.")
+    if end < start + FIT_MIN_WINDOW_HOURS:
+        raise ValueError(f"'Fit to' must be at least {FIT_MIN_WINDOW_HOURS:g} h after 'Fit from'.")
+    lo, hi = FIT_PERIOD_LIMITS
+    if not lo <= pmin < pmax <= hi:
+        raise ValueError(f"The period bounds must satisfy {lo:g} \u2264 min < max \u2264 {hi:g} h.")
+    return {"fit_model": model, "fit_start_hour": start, "fit_end_hour": end,
+            "fit_min_period": pmin, "fit_max_period": pmax}
+
+
+def resolve_fit_options(fit_options, s) -> dict:
+    """Sine-fit options of every channel: per-channel entries override the defaults."""
+    base = default_fit_options(s)
+    resolved = {}
+    for channel in CHANNELS:
+        entry = dict(base)
+        entry.update({k: v for k, v in ((fit_options or {}).get(channel) or {}).items()
+                      if k in FIT_OPTION_KEYS})
+        resolved[channel] = entry
+    return resolved
+
+
+def fit_one_channel(detrended: pd.DataFrame, channel: str, options: dict) -> dict:
+    """Fit a channel's detrended data within its window.  Never raises.
+
+    Returns {"row": table row, "fit": fit_sine() result or None, "times", "values"}.
+    """
+    start, end = options["fit_start_hour"], options["fit_end_hour"]
+    window = detrended[detrended["Hours"].between(start, end)]
+    values = window[channel].dropna()
+    times = window.loc[values.index, "Hours"]
+    row = {column: np.nan for column in FIT_COLUMNS}
+    row.update({"Channel": channel, "Model": options["fit_model"], "N Points": len(values),
+                "Fit Start (h)": start, "Fit End (h)": end,
+                "Min Period (h)": options["fit_min_period"],
+                "Max Period (h)": options["fit_max_period"]})
+    if len(values) < FIT_MIN_POINTS:
+        row["Status"] = f"Skipped: only {len(values)} points in the window"
+        return {"row": row, "fit": None, "times": times, "values": values}
+    try:
+        fit = fit_sine(times.to_numpy(), values.to_numpy(), options["fit_model"],
+                       options["fit_min_period"], options["fit_max_period"])
+    except Exception as error:  # noqa: BLE001 - one bad channel must not stop the others
+        row["Status"] = f"Failed: {error}"
+        return {"row": row, "fit": None, "times": times, "values": values}
+    row.update({
+        "Fitted Amplitude": fit["amplitude"], "Fitted Period (Hours)": fit["period"],
+        "Fitted Phase (radians)": fit["phase"], "Fitted Decay Rate": fit["decay"],
+        "Fitted Offset": fit["offset"], "Peak Phase (h)": fit["peak_time"],
+        "R squared": fit["r2"], "RMSE": fit["rmse"],
+    })
+    at_bound = min(abs(fit["period"] - options["fit_min_period"]),
+                   abs(fit["period"] - options["fit_max_period"]))
+    if at_bound <= 1e-3:
+        row["Status"] = "Period at the search limit"
+    elif not fit["r2"] >= FIT_MIN_R2:
+        row["Status"] = f"Poor fit (R\u00b2 < {FIT_MIN_R2:g})"
+    else:
+        row["Status"] = "OK"
+    return {"row": row, "fit": fit, "times": times, "values": values}
+
+
+def fit_summary_text(row: dict) -> str:
+    status = str(row.get("Status", ""))
+    if status.startswith(("Skipped", "Failed")):
+        return f"Sine fit: {status}"
+    text = (f"Sine fit ({row['Model']}, {row['Fit Start (h)']:g}\u2013{row['Fit End (h)']:g} h): "
+            f"period = {row['Fitted Period (Hours)']:.2f} h, "
+            f"amplitude = {row['Fitted Amplitude']:.3g}, "
+            f"peak phase = {row['Peak Phase (h)']:.2f} h, R\u00b2 = {row['R squared']:.3f}")
+    if row["Model"] == "Damped sine":
+        text += f", decay = {row['Fitted Decay Rate']:.4f} /h"
+    if status != "OK":
+        text += f"  [{status}]"
+    return text
 
 
 def plot_fit_page(
@@ -1363,28 +1633,24 @@ def plot_fit_page(
     raw: pd.DataFrame,
     trend: Trend,
     detrended: pd.DataFrame,
-    fit_times: pd.Series,
-    fit_values: pd.Series,
-    model_times: pd.Series,
-    params: np.ndarray,
-    phase: float,
+    detail: dict,
     axis: AxisStyle,
-    start_hour: float,
-    end_hour: float,
 ) -> None:
-    amplitude, period, _, decay_rate, offset = params
-    fitted = damped_sine(model_times, *params)
+    fit, row = detail["fit"], detail["row"]
+    fit_times, fit_values = detail["times"], detail["values"]
+    fitted = fit_curve(fit, fit_times)
+    start_hour, end_hour = row["Fit Start (h)"], row["Fit End (h)"]
 
     with plt.rc_context(FIT_PAGE_RC):
         figure, (ax_raw, ax_detrended) = plt.subplots(
             2, 1, figsize=(8.5, 11), sharex=True
         )
         figure.suptitle(
-            f"{experiment_number} - Damped Sine Fit Channel {channel}", fontsize=12
+            f"{experiment_number} - {row['Model']} Fit Channel {channel}", fontsize=12
         )
 
         # The raw-scale fit is the detrended fit put back on top of the trend.
-        raw_fit = fitted + trend.data.loc[fit_times.index, channel]
+        raw_fit = fitted + trend.data.loc[fit_times.index, channel].to_numpy()
         ax_raw.plot(
             raw["Hours"], raw[channel], "o", markersize=2, color="gray",
             label="Full Raw Data",
@@ -1396,7 +1662,8 @@ def plot_fit_page(
         ax_raw.plot(fit_times, raw_fit, "r-", linewidth=1.5, label="Raw Data Fit")
         ax_raw.set_ylabel("Bioluminescence", fontsize=10)
         ax_raw.set_title(
-            f"Raw Data Fit (P={period:.2f}h A={amplitude:.2f} Ph={phase:.2f})",
+            f"Raw Data Fit (P={fit['period']:.2f}h A={fit['amplitude']:.2f} "
+            f"Ph={fit['phase']:.2f})",
             fontsize=11,
         )
         ax_raw.set_ylim(bottom=0)
@@ -1409,15 +1676,19 @@ def plot_fit_page(
         )
         ax_detrended.plot(
             fit_times, fit_values, "o", markersize=2, color="blue",
-            label=f"Data for Fitting (from {start_hour}h to {end_hour}h)",
+            label=f"Data for Fitting (from {start_hour:g}h to {end_hour:g}h)",
         )
         ax_detrended.plot(
-            fit_times, fitted, "r-", linewidth=1.5, label="Damped Sine Fit"
+            fit_times, fitted, "r-", linewidth=1.5, label=f"{row['Model']} Fit"
         )
         ax_detrended.set_xlabel("Time (Hours)", fontsize=10)
         ax_detrended.set_ylabel("Detrended Bioluminescence", fontsize=10)
+        if row["Model"] == "Damped sine":
+            subtitle = f"Dec={fit['decay']:.6f} Off={fit['offset']:.6f}"
+        else:
+            subtitle = f"Off={fit['offset']:.6f}"
         ax_detrended.set_title(
-            f"Detrended Data Fit (Dec={decay_rate:.6f} Off={offset:.6f})", fontsize=11
+            f"Detrended Data Fit ({subtitle}  R\u00b2={fit['r2']:.3f})", fontsize=11
         )
         ax_detrended.legend(loc="upper right", fontsize=8)
         ax_detrended.grid(True, linestyle="--", alpha=0.7)
@@ -1439,50 +1710,25 @@ def fit_all_channels(
     trend: Trend,
     detrended: pd.DataFrame,
     axis: AxisStyle,
-    start_hour: float,
-    end_hour: float,
+    fit_options: dict,
     on_channel=None,
+    details: dict | None = None,
 ) -> pd.DataFrame:
-    window = detrended[
-        detrended["Hours"].between(start_hour, end_hour)
-    ]
+    """Fit every channel with its own options ({channel: options}) and plot the fits.
 
+    `details` = {channel: fit_one_channel() result} reuses fits already computed.
+    """
     results = []
     for channel in channel_order:
         if on_channel is not None:
             on_channel(channel)
-        values = window[channel].dropna()
-        times = window.loc[values.index, "Hours"]
-
-        if len(values) < FIT_MIN_POINTS:
-            print(
-                f"Skipping damped sine fit for Channel {channel}: only {len(values)} "
-                f"points in the fitting window (need {FIT_MIN_POINTS})."
-            )
-            results.append(_empty_fit(channel))
-            continue
-
-        # The model's decay term assumes t starts at 0.
-        model_times = times - times.min()
-        try:
-            params, phase = fit_damped_sine(model_times, values)
-        except (RuntimeError, ValueError) as error:
-            print(f"Could not fit damped sine to Channel {channel}: {error}")
-            results.append(_empty_fit(channel))
-            continue
-
-        amplitude, period, _, decay_rate, offset = params
-        results.append(
-            {
-                "Channel": channel,
-                "Fitted Amplitude": amplitude,
-                "Fitted Period (Hours)": period,
-                "Fitted Phase (radians)": phase,
-                "Fitted Decay Rate": decay_rate,
-                "Fitted Offset": offset,
-            }
+        detail = (details or {}).get(channel) or fit_one_channel(
+            detrended, channel, fit_options[channel]
         )
-
+        results.append(detail["row"])
+        if detail["fit"] is None:
+            print(f"Sine fit, channel {channel}: {detail['row']['Status']}")
+            continue
         plot_fit_page(
             pdf,
             channel=channel,
@@ -1490,20 +1736,51 @@ def fit_all_channels(
             raw=raw,
             trend=trend,
             detrended=detrended,
-            fit_times=times,
-            fit_values=values,
-            model_times=model_times,
-            params=params,
-            phase=phase,
+            detail=detail,
             axis=axis,
-            start_hour=start_hour,
-            end_hour=end_hour,
         )
 
     return pd.DataFrame(results, columns=FIT_COLUMNS)
 
 
+# --------------------------------------------------------------------------- #
+# Legends to the right of a graph (review window)
+# --------------------------------------------------------------------------- #
 
+LEGEND_WRAP_CHARS = 18   # maximum characters per line of an outside legend entry
+
+
+def wrap_label(text: str, width: int = LEGEND_WRAP_CHARS) -> str:
+    """Break a legend label into short lines without splitting '48 h' or 'T = 24 h'."""
+    import textwrap
+
+    nbsp = "\u00a0"
+    text = re.sub(r"(\d) (h|min|points?)\b", rf"\1{nbsp}\2", str(text))
+    text = re.sub(r"\b(order|window|cutoff) (\d)", rf"\1{nbsp}\2", text)
+    text = text.replace(" = ", f"{nbsp}={nbsp}")
+    lines = textwrap.wrap(text, width=width, break_long_words=False, break_on_hyphens=False)
+    return "\n".join(lines).replace(nbsp, " ")
+
+
+def outside_legend(ax, fontsize: float = 6.0, width: int = LEGEND_WRAP_CHARS, **kwargs):
+    """Legend to the right of the axes (top-aligned), small font, wrapped labels."""
+    handles, labels = ax.get_legend_handles_labels()
+    if not handles:
+        legend = ax.get_legend()
+        if legend is not None:
+            legend.remove()
+        return None
+    legend = ax.legend(handles, [wrap_label(label, width) for label in labels],
+                       loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0,
+                       fontsize=fontsize, handlelength=1.6, labelspacing=0.5,
+                       borderpad=0.4, **kwargs)
+    for handle in getattr(legend, "legend_handles", getattr(legend, "legendHandles", [])):
+        # data-point symbols are drawn tiny in the plot; make them visible in the legend
+        if hasattr(handle, "get_sizes") and len(handle.get_sizes()) and max(handle.get_sizes()) < 12:
+            handle.set_sizes([12])
+        elif hasattr(handle, "get_markersize") and handle.get_markersize() < 3.5:
+            handle.set_markersize(3.5)
+    return legend
 
 
 # --------------------------------------------------------------------------- #
@@ -1684,6 +1961,7 @@ def write_outputs(
     reg_selection: RegSelection | None = None,
     actogram_period=None,
     detrend_params: dict | None = None,
+    fit_options: dict | None = None,
 ) -> list[Path]:
     """Write the Excel files, ZIP and PDF. Returns the list of files written.
 
@@ -1693,7 +1971,9 @@ def write_outputs(
     one number for every channel or a {channel: hours} dict (default: the value in
     the settings, 24 h).  `detrend_params` is {channel: DetrendParams} when the
     channels are detrended differently from `analysis` (the trend, detrended data and
-    automatic peaks are then recalculated).
+    automatic peaks are then recalculated).  `fit_options` is {channel: sine-fit
+    options} from the review window (model, fit range, period bounds); channels
+    without an entry use the fit range of the settings and a damped sine.
     """
     report = _reporter(progress)
     s = analysis.settings
@@ -1743,10 +2023,20 @@ def write_outputs(
         else f"Set per channel (see the '{REGRESSION_SHEET}' sheet)"
     )
 
-    start_hour, end_hour = s.fit_start_hour, s.fit_end_hour
-    if end_hour - start_hour <= 23:  # too short to see a full cycle; fall back
-        start_hour, end_hour = 24, 120
-        print(f"Fitting window was shorter than 24 h; using {start_hour}-{end_hour} h instead.")
+    fit_opts = resolve_fit_options(fit_options, s)
+    if float(s.fit_end_hour) - float(s.fit_start_hour) < FIT_MIN_WINDOW_HOURS:
+        start_hour, end_hour = FIT_DEFAULT_WINDOW  # too short to see a full cycle
+        print(f"Fitting window was shorter than 24 h; using {start_hour:g}-{end_hour:g} h "
+              "instead (unless set per channel in the review window).")
+    per_channel_fit = any(fit_opts[ch] != fit_opts[CHANNELS[0]] for ch in CHANNELS)
+    first_fit = fit_opts[CHANNELS[0]]
+    fit_note = (
+        "Set per channel in the review window (see the fit workbook)"
+        if per_channel_fit
+        else f"{first_fit['fit_model']}, {first_fit['fit_start_hour']:g}\u2013"
+             f"{first_fit['fit_end_hour']:g} h, period bounds {first_fit['fit_min_period']:g}"
+             f"\u2013{first_fit['fit_max_period']:g} h"
+    )
 
     start_time = utc_now()
     print(f"\nWriting output files ({'hand-edited' if edited else 'automatic'} peaks/troughs)")
@@ -1776,6 +2066,7 @@ def write_outputs(
                 "Regression Phase (Hours)",
                 "Fitted peak/trough time modulo the period, counted from Hours = 0",
             ),
+            ("Sine Fit", fit_note),
             ("", ""),
             ("Data Processed Date and Time (UTC)", utc_now_string()),
         ]
@@ -1844,9 +2135,15 @@ def write_outputs(
             start_y_at_zero=False,
         )
 
+        print("\nPerforming sine curve fitting...")
+        fit_details = {}
+        for i, channel in enumerate(channel_order):
+            report(0.33 + 0.07 * i / N_CHANNELS, f"Fitting channel {channel}...")
+            fit_details[channel] = fit_one_channel(detrended, channel, fit_opts[channel])
+
         print("\nPlotting individual channels with actograms...")
         for i, channel in enumerate(channel_order):
-            report(0.35 + 0.35 * i / N_CHANNELS, f"Plotting channel {channel}...")
+            report(0.40 + 0.35 * i / N_CHANNELS, f"Plotting channel {channel}...")
             plot_channel_page(
                 pdf,
                 channel=channel,
@@ -1864,13 +2161,14 @@ def write_outputs(
                 peaks_troughs=peaks[channel],
                 reg_selection=regressions[channel]["used"],
                 regression=regressions[channel],
+                fit_detail=fit_details[channel],
             )
 
-        print("\nPerforming damped sine curve fitting...")
+        print("\nPlotting the sine-fit pages...")
         counter = {"n": 0}
 
         def on_channel(channel: str) -> None:
-            report(0.70 + 0.28 * counter["n"] / N_CHANNELS, f"Fitting channel {channel}...")
+            report(0.75 + 0.23 * counter["n"] / N_CHANNELS, f"Plotting fit, channel {channel}...")
             counter["n"] += 1
 
         fit_results = fit_all_channels(
@@ -1881,15 +2179,15 @@ def write_outputs(
             trend=trend,
             detrended=detrended,
             axis=axis,
-            start_hour=start_hour,
-            end_hour=end_hour,
+            fit_options=fit_opts,
             on_channel=on_channel,
+            details=fit_details,
         )
 
     with pd.ExcelWriter(str(fit_workbook)) as writer:
         fit_results.to_excel(writer, sheet_name="Damped Sine Fit", index=False)
         regression_summary.to_excel(writer, sheet_name=REGRESSION_SHEET, index=False)
-    print(f"\nDamped sine fitting results written to: {fit_workbook.name}")
+    print(f"\nSine fitting results written to: {fit_workbook.name}")
 
     outputs = [main_workbook, raw_workbook, fit_workbook, zip_archive, plot_pdf]
     end_time = utc_now()
@@ -1908,11 +2206,13 @@ def run_analysis(
     reg_selection: RegSelection | None = None,
     actogram_period=None,
     detrend_params: dict | None = None,
+    fit_options: dict | None = None,
 ) -> list[Path]:
     """analyze() + write_outputs() in one call (no review step)."""
     analysis = analyze(input_path, settings, progress)
     return write_outputs(
-        analysis, output_dir, peaks, progress, reg_selection, actogram_period, detrend_params
+        analysis, output_dir, peaks, progress, reg_selection, actogram_period, detrend_params,
+        fit_options,
     )
 
 
@@ -2327,7 +2627,7 @@ class App:
 
     def _export_worker(
         self, analysis: Analysis, out_dir: str, peaks, reg_selection, actogram_period,
-        detrend_params=None,
+        detrend_params=None, fit_options=None,
     ) -> None:
         """Background thread, step 2: write Excel / ZIP / PDF files."""
         writer = _QueueWriter(self.queue)
@@ -2336,7 +2636,7 @@ class App:
                 outputs = write_outputs(
                     analysis, out_dir, peaks, progress=self._progress_callback(),
                     reg_selection=reg_selection, actogram_period=actogram_period,
-                    detrend_params=detrend_params,
+                    detrend_params=detrend_params, fit_options=fit_options,
                 )
             self.queue.put(("done", outputs))
         except Exception as error:  # noqa: BLE001 - shown to the user
@@ -2356,12 +2656,14 @@ class App:
                 float(analysis.settings.actogram_x_scale),
             )
 
-    def _start_export(self, peaks, reg_selection, actogram_period, detrend_params=None) -> None:
+    def _start_export(
+        self, peaks, reg_selection, actogram_period, detrend_params=None, fit_options=None
+    ) -> None:
         self.progress["value"] = 0
         self.status_var.set("Writing output files...")
         self._run_in_thread(
             self._export_worker, self.analysis, self.pending_out_dir,
-            peaks, reg_selection, actogram_period, detrend_params,
+            peaks, reg_selection, actogram_period, detrend_params, fit_options,
         )
 
     def _on_review_cancel(self) -> None:
@@ -2424,6 +2726,9 @@ class App:
         self.log.configure(state="disabled")
 
 
+REVIEW_LEGEND_FONTSIZE = 6.0   # legends to the right of the review window's graphs
+
+
 class ReviewWindow:
     """Modal window for checking and hand-editing the detected peaks/troughs.
 
@@ -2456,7 +2761,13 @@ class ReviewWindow:
         "anything.   Detrending (bottom of the controls) is chosen per channel: pick the method "
         "and parameters and press Apply; the trend, the detrended curve and the automatic "
         "peaks/troughs of that channel are recalculated (hand edits of the channel are "
-        "discarded).   Switch channels with the list or the Left/Right keys."
+        "discarded).   Sine fit (row 'Sine fit, this channel'): choose the model, the fit "
+        "range ('from' / 'to', in hours) and the period search range, then press Enter or "
+        "'Apply'; the fitted curve is drawn in orange in the middle plot and the fit range is "
+        "shown by green dotted lines ('Show sine fit' hides them).  'Apply to all' copies the "
+        "settings to every channel, 'Default' restores the main window's settings; channels "
+        "with their own settings are marked 'f' in the list.  The exported fit workbook and "
+        "fit pages use these settings.   Switch channels with the list or the Left/Right keys."
     )
 
     def __init__(self, parent, analysis: Analysis, on_ok, on_cancel) -> None:
@@ -2485,6 +2796,12 @@ class ReviewWindow:
         default_period = self._clamp_period(float(analysis.settings.actogram_x_scale))
         self.periods = {ch: default_period for ch in CHANNELS}
         self.channel = CHANNELS[0]
+        # sine-fit options per channel (default: the main window's settings)
+        self.default_fit = default_fit_options(analysis.settings)
+        self.fit_options = {ch: dict(self.default_fit) for ch in CHANNELS}
+        self._fit_cache: dict = {}
+        self._fit_inputs: list = []
+        self._fit_text = ""
         self._marker_artists: list = []
         self._drag: dict | None = None
         self._drag_patch = None
@@ -2499,8 +2816,13 @@ class ReviewWindow:
         win.title("Review peaks and troughs")
         _fit_geometry(win, 1200, 1020)
         win.minsize(900, 660)
-        win.transient(parent)
+        # Not win.transient(parent): a transient (dialog) window gets only a Close button
+        # on Windows and many Linux desktops.  As a normal window it also has Minimize and
+        # Maximize; _link_to_parent() keeps it together with the (blocked) main window.
+        win.resizable(True, True)
         win.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.parent = parent
+        self._syncing_state = False
         win.columnconfigure(1, weight=1)
         win.rowconfigure(1, weight=1)
 
@@ -2508,6 +2830,12 @@ class ReviewWindow:
         self.status_var = tk.StringVar(value="")
         self.period_var = tk.StringVar(value=f"{self.day_length:g}")
         self.reg_var = tk.StringVar(value="")
+        self.fit_var = tk.BooleanVar(value=True)
+        self.fit_model_var = tk.StringVar()
+        self.fit_start_var = tk.StringVar()
+        self.fit_end_var = tk.StringVar()
+        self.fit_pmin_var = tk.StringVar()
+        self.fit_pmax_var = tk.StringVar()
 
         # The instructions are hidden by default (more room for the graphs);
         # the Help button in the bottom bar shows/hides them.
@@ -2520,9 +2848,11 @@ class ReviewWindow:
         # --- channel list ------------------------------------------------- #
         left = ttk.Frame(win, padding=(10, 0, 4, 0))
         left.grid(row=1, column=0, sticky="ns")
-        ttk.Label(left, text="Channel  (P peaks, T troughs, * edited, D detrend changed)").pack(
-            anchor="w"
-        )
+        ttk.Label(
+            left,
+            text="Channel  (P peaks, T troughs, * edited,\n"
+                 "D detrend changed, f own sine-fit settings)",
+        ).pack(anchor="w")
         list_frame = ttk.Frame(left)
         list_frame.pack(fill="y", expand=True)
         self.listbox = tk.Listbox(list_frame, width=26, height=30, exportselection=False)
@@ -2550,6 +2880,10 @@ class ReviewWindow:
             ttk.Radiobutton(controls, text=text, value=value, variable=self.mode_var).pack(
                 side="left", padx=(0, 14)
             )
+        ttk.Checkbutton(
+            controls, text="Show sine fit", variable=self.fit_var,
+            command=lambda: self._draw_full(keep_view=True),
+        ).pack(side="left", padx=(6, 0))
         ttk.Button(controls, text="Next \u25b6", command=lambda: self._step(1)).pack(side="right")
         ttk.Button(controls, text="\u25c0 Previous", command=lambda: self._step(-1)).pack(
             side="right", padx=4
@@ -2589,6 +2923,9 @@ class ReviewWindow:
         self.period_spin.bind("<Return>", self._apply_period)
         self.period_spin.bind("<FocusOut>", self._apply_period)
         ttk.Button(acto, text="24 h", width=5, command=lambda: self._set_period(24.0)).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(acto, text="= fit period", command=self._period_from_fit).pack(
             side="left", padx=(6, 0)
         )
         ttk.Button(acto, text="Apply to all channels", command=self._period_to_all).pack(
@@ -2644,11 +2981,57 @@ class ReviewWindow:
         ttk.Button(det, text="Default", command=self._detrend_default).pack(
             side="left", padx=(4, 0)
         )
-        self._entry_widgets = (
-            self.period_spin, self.window_spin, self.cutoff_spin, self.order_spin, self.method_box,
+        # --- sine fit of the current channel -------------------------------- #
+        fitbar = ttk.Frame(centre)
+        fitbar.pack(fill="x", pady=(0, 4))
+        ttk.Label(fitbar, text="Sine fit, this channel:").pack(side="left", padx=(0, 4))
+        self.fit_model_combo = ttk.Combobox(
+            fitbar, textvariable=self.fit_model_var, values=list(FIT_MODELS),
+            state="readonly", width=17,
+        )
+        self.fit_model_combo.pack(side="left")
+        self.fit_model_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_fit())
+        self._fit_inputs.append(self.fit_model_combo)
+
+        def fit_spin(label, var, lo, hi, step, padx=(8, 2)):
+            ttk.Label(fitbar, text=label).pack(side="left", padx=padx)
+            spin = ttk.Spinbox(
+                fitbar, from_=lo, to=hi, increment=step, textvariable=var, width=7,
+                justify="right", format="%.1f", command=self._apply_fit,
+            )
+            spin.pack(side="left")
+            spin.bind("<Return>", self._apply_fit)
+            spin.bind("<KP_Enter>", self._apply_fit)
+            self._fit_inputs.append(spin)
+            return spin
+
+        fit_spin("from", self.fit_start_var, 0, 100000, 1.0)
+        fit_spin("to", self.fit_end_var, 0, 100000, 1.0, padx=(6, 2))
+        ttk.Label(fitbar, text="h").pack(side="left", padx=(2, 0))
+        fit_spin("period", self.fit_pmin_var, FIT_PERIOD_LIMITS[0], FIT_PERIOD_LIMITS[1], 0.5)
+        fit_spin("\u2013", self.fit_pmax_var, FIT_PERIOD_LIMITS[0], FIT_PERIOD_LIMITS[1], 0.5,
+                 padx=(2, 2))
+        ttk.Label(fitbar, text="h").pack(side="left", padx=(2, 0))
+        ttk.Button(fitbar, text="Apply", command=self._apply_fit).pack(side="left", padx=(10, 0))
+        ttk.Button(fitbar, text="Apply to all", command=self._fit_to_all).pack(
+            side="left", padx=(4, 0)
+        )
+        ttk.Button(fitbar, text="Default", command=self._fit_default).pack(
+            side="left", padx=(4, 0)
         )
 
-        self.fig = Figure(figsize=(8, 8.4), dpi=100)
+        self._entry_widgets = (
+            self.period_spin, self.window_spin, self.cutoff_spin, self.order_spin, self.method_box,
+            *self._fit_inputs,
+        )
+
+        # Constrained layout keeps the three graphs aligned while making room for the
+        # legends, which sit to the right of each graph (not inside it).
+        try:
+            self.fig = Figure(figsize=(8, 8.4), dpi=100, layout="constrained")
+            self.fig.get_layout_engine().set(h_pad=0.04, w_pad=0.04, hspace=0.02)
+        except (TypeError, AttributeError):  # matplotlib < 3.6
+            self.fig = Figure(figsize=(8, 8.4), dpi=100, constrained_layout=True)
         grid = self.fig.add_gridspec(3, 1, height_ratios=[0.75, 1.0, 1.15])
         self.ax_raw = self.fig.add_subplot(grid[0])
         self.ax = self.fig.add_subplot(grid[1])
@@ -2690,6 +3073,7 @@ class ReviewWindow:
         )
         ttk.Button(bottom, text="Save edits...", command=self._save_edits).pack(side="right")
 
+        self._link_to_parent()
         win.bind("<Left>", lambda _e: self._key_step(-1))
         win.bind("<Right>", lambda _e: self._key_step(1))
         win.bind("<comma>", lambda _e: self._key_zoom(lambda: self._jump_marker(-1)))
@@ -2705,8 +3089,111 @@ class ReviewWindow:
         win.focus_set()
 
     # ------------------------------------------------------------------ #
+    # Window management (minimize / maximize together with the main window)
+    # ------------------------------------------------------------------ #
+
+    def _link_to_parent(self) -> None:
+        """Minimizing the review window minimizes the main window too; restoring either
+        one brings both back with the review window in front.  While the review window
+        is open the main window is blocked, so a click on it raises the review window."""
+        self.win.bind("<Unmap>", self._on_review_unmap, add="+")
+        self.win.bind("<Map>", self._on_review_map, add="+")
+        self._parent_bindings = [
+            ("<Map>", self.parent.bind("<Map>", self._on_parent_map, add="+")),
+            ("<FocusIn>", self.parent.bind("<FocusIn>", self._on_parent_focus, add="+")),
+        ]
+
+    def _unlink_from_parent(self) -> None:
+        for sequence, funcid in getattr(self, "_parent_bindings", []):
+            try:
+                # remove only our own callback (unbind(sequence, funcid) would drop all)
+                script = self.parent.bind(sequence) or ""
+                kept = "\n".join(
+                    line for line in script.split("\n") if funcid not in line
+                )
+                self.parent.bind(sequence, kept)
+                self.parent.deletecommand(funcid)
+            except tk.TclError:
+                pass
+        self._parent_bindings = []
+
+    @staticmethod
+    def _window_state(window) -> str:
+        try:
+            return str(window.state())
+        except tk.TclError:
+            return "withdrawn"
+
+    def _on_review_unmap(self, event) -> None:
+        if event.widget is not self.win or self._closed or self._syncing_state:
+            return
+        if self._window_state(self.win) == "iconic":
+            self._syncing_state = True
+            try:
+                self.parent.iconify()
+            except tk.TclError:
+                pass
+            finally:
+                self._syncing_state = False
+
+    def _on_review_map(self, event) -> None:
+        if event.widget is not self.win or self._closed or self._syncing_state:
+            return
+        if self._window_state(self.parent) == "iconic":
+            self._syncing_state = True
+            try:
+                self.parent.deiconify()
+            except tk.TclError:
+                pass
+            finally:
+                self._syncing_state = False
+        self._raise()
+
+    def _on_parent_map(self, event) -> None:
+        if event.widget is not self.parent or self._closed or self._syncing_state:
+            return
+        if self._window_state(self.win) == "iconic":
+            self._syncing_state = True
+            try:
+                self.win.deiconify()
+            except tk.TclError:
+                pass
+            finally:
+                self._syncing_state = False
+        self._raise()
+
+    def _on_parent_focus(self, _event=None) -> None:
+        if not self._closed and self._window_state(self.win) not in ("iconic", "withdrawn"):
+            self.win.after_idle(self._raise)
+
+    def _raise(self) -> None:
+        if self._closed:
+            return
+        try:
+            self.win.lift()
+            self.win.focus_force()
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
+
+    def _fit(self, channel: str) -> dict:
+        """Sine fit of a channel with its current options (cached)."""
+        if channel not in self._fit_cache:
+            self._fit_cache[channel] = fit_one_channel(
+                self.data, channel, self.fit_options[channel]
+            )
+        return self._fit_cache[channel]
+
+    def _typing(self) -> bool:
+        """True while a text box has the focus (arrow/,/. keys then edit the text)."""
+        try:
+            focus = self.win.focus_get()
+        except (KeyError, tk.TclError):  # e.g. a combobox drop-down has the focus
+            return True
+        return focus in self._entry_widgets
 
     @property
     def day_length(self) -> float:
@@ -2760,6 +3247,8 @@ class ReviewWindow:
         mark = "  *" if self._is_edited(channel) else ""
         if not self.params[channel].same_as(self.default_params):
             mark += "  D"
+        if self.fit_options[channel] != self.default_fit:
+            mark += "  f"
         return f"Ch {channel}    P {len(peaks)}   T {len(troughs)}{mark}"
 
     def _refresh_list_item(self, channel: str) -> None:
@@ -2773,17 +3262,19 @@ class ReviewWindow:
         selected = self.listbox.curselection()
         if selected and CHANNELS[selected[0]] != self.channel:
             self._apply_period()  # commit a typed value to the channel being left
+            self._apply_fit(redraw=False, quiet=True)
             self.channel = CHANNELS[selected[0]]
             self._draw_full()
 
     def _key_step(self, delta: int) -> None:
         # Left/Right must keep moving the cursor while the period box is being edited.
-        if self.win.focus_get() in self._entry_widgets:
+        if self._typing():
             return
         self._step(delta)
 
     def _step(self, delta: int) -> None:
         self._apply_period()
+        self._apply_fit(redraw=False, quiet=True)
         i = min(max(CHANNELS.index(self.channel) + delta, 0), len(CHANNELS) - 1)
         self.listbox.selection_clear(0, "end")
         self.listbox.selection_set(i)
@@ -2796,10 +3287,14 @@ class ReviewWindow:
     # Drawing
     # ------------------------------------------------------------------ #
 
-    def _draw_full(self) -> None:
-        """Redraw the curve, the markers and the actogram for the current channel."""
+    def _draw_full(self, keep_view: bool = False) -> None:
+        """Redraw the curve, the markers and the actogram for the current channel.
+
+        keep_view=True keeps the current zoom (e.g. after changing the sine fit).
+        """
         channel = self.channel
         ax = self.ax
+        kept = (ax.get_xlim(), ax.get_ylim()) if keep_view and not self._is_full_view() else None
         ax.clear()
         self._marker_artists = []  # ax.clear() already discarded the old markers
         ax.scatter(
@@ -2807,9 +3302,28 @@ class ReviewWindow:
             label="Detrended bioluminescence",
         )
         ax.plot(
-            self.smooth["Hours"], self.smooth[channel], "-b", linewidth=1.0,
+            self.smooth["Hours"], self.smooth[channel], "-", color=MOVING_AVERAGE_COLOR, linewidth=1.0,
             label="9-point moving average",
         )
+        fit_text = ""
+        if self.fit_var.get():
+            detail = self._fit(channel)
+            if detail["fit"] is not None:
+                ax.plot(
+                    detail["times"], fit_curve(detail["fit"], detail["times"]), "-",
+                    color=SINE_FIT_COLOR, linewidth=1.3, alpha=0.9, zorder=3,
+                    label=("Damped sine fit" if detail["row"]["Model"] == "Damped sine"
+                           else "Sine fit (no damping)"),
+                )
+            fit_text = "\n" + fit_summary_text(detail["row"])
+            options = self.fit_options[channel]
+            for i, x in enumerate((options["fit_start_hour"], options["fit_end_hour"])):
+                ax.axvline(
+                    x, color="darkgreen", linestyle=":", linewidth=1.2,
+                    label="Fit range" if i == 0 else None,
+                )
+        self._fit_text = fit_text
+        self._show_fit_options()
         ax.grid(True, linewidth=0.5, color="lightgray", linestyle="--")
         ax.set_xlabel("Hours")
         ax.set_ylabel("Detrended bioluminescence")
@@ -2827,15 +3341,18 @@ class ReviewWindow:
         ax.set_autoscale_on(False)  # keep the view fixed while markers change
         self._full_xlim = (x_min, x_max)
         self._full_ylim = ax.get_ylim()
-        self._focus_row = None
+        if not keep_view:
+            self._focus_row = None
         self._pan = None
         self._draw_raw_trend(x_min, x_max)
         # ax.clear() dropped earlier callbacks; follow every x change (ours or the toolbar's)
         ax.callbacks.connect("xlim_changed", self._on_view_changed)
+        if kept is not None:
+            ax.set_xlim(*kept[0])
+            ax.set_ylim(*kept[1])
         self._on_view_changed(ax)
         self._load_detrend_widgets()
         self.period_var.set(f"{self.day_length:g}")  # each channel has its own period
-        self.fig.tight_layout()
         self.toolbar.update()  # forget the previous channel's zoom history
         self._draw_markers()
         self._draw_actogram_preview()
@@ -2857,7 +3374,7 @@ class ReviewWindow:
         ax.set_ylim(0, upper_ylimit(self.raw[channel]))
         ax.set_xlabel("Hours")
         ax.set_ylabel("Bioluminescence")
-        ax.legend(loc="upper right", fontsize=7, framealpha=0.6)
+        outside_legend(ax, fontsize=REVIEW_LEGEND_FONTSIZE)
         ax.set_navigate(False)  # zoom/pan applies to the detrended plot only
         self._view_span = None  # ax.clear() above discarded the band
 
@@ -2915,6 +3432,7 @@ class ReviewWindow:
         self.smooth[channel] = smooth_series(detrended, 9)
         self.trend_labels[channel] = label
         self.params[channel] = params
+        self._fit_cache.pop(channel, None)  # the detrended data changed
         peaks, troughs = find_peaks_and_troughs(
             self.smooth[channel], PEAK_MIN_SEPARATION_HOURS, self.time_interval
         )
@@ -2998,7 +3516,7 @@ class ReviewWindow:
                     linewidths=2.0, zorder=6,
                 )
             )
-        # No legend here: the colours are self-explanatory and the PDF has the legend.
+        outside_legend(ax, fontsize=REVIEW_LEGEND_FONTSIZE)
 
     def _draw_actogram_preview(self) -> None:
         settings = self.analysis.settings
@@ -3013,9 +3531,12 @@ class ReviewWindow:
             settings.label_actogram,
             selected=used, regression=regression,
         )
+        # same legend, but with the small wrapped labels of the review window
+        outside_legend(self.ax_act, fontsize=REVIEW_LEGEND_FONTSIZE)
         self.ax_act.set_navigate(False)  # zoom/pan applies to the top plot only
-        self.reg_var.set(regression_summary_text(regression, len(used[0]), len(used[1])))
-        self.fig.tight_layout()  # the legend sits outside the actogram axes
+        self.reg_var.set(
+            regression_summary_text(regression, len(used[0]), len(used[1])) + self._fit_text
+        )
         self.canvas.draw_idle()
 
     def _after_edit(self, message: str) -> None:
@@ -3023,6 +3544,98 @@ class ReviewWindow:
         self._draw_markers()
         self._draw_actogram_preview()
         self.status_var.set(message)
+
+    # ------------------------------------------------------------------ #
+    # Sine fit settings (per channel)
+    # ------------------------------------------------------------------ #
+
+    def _show_fit_options(self) -> None:
+        """Put the current channel's sine-fit settings into the input boxes."""
+        options = self.fit_options[self.channel]
+        self.fit_model_var.set(options["fit_model"])
+        self.fit_start_var.set(f"{options['fit_start_hour']:g}")
+        self.fit_end_var.set(f"{options['fit_end_hour']:g}")
+        self.fit_pmin_var.set(f"{options['fit_min_period']:g}")
+        self.fit_pmax_var.set(f"{options['fit_max_period']:g}")
+
+    def _read_fit_inputs(self) -> dict:
+        names = (
+            ("fit_start_hour", self.fit_start_var, "'from'"),
+            ("fit_end_hour", self.fit_end_var, "'to'"),
+            ("fit_min_period", self.fit_pmin_var, "The minimum period"),
+            ("fit_max_period", self.fit_pmax_var, "The maximum period"),
+        )
+        options = {"fit_model": self.fit_model_var.get()}
+        for key, var, text in names:
+            try:
+                options[key] = float(str(var.get()).strip().replace(",", "."))
+            except (ValueError, tk.TclError):
+                raise ValueError(f"{text} must be a number.") from None
+        return check_fit_options(options)
+
+    def _apply_fit(self, _event=None, redraw: bool = True, quiet: bool = False) -> bool:
+        """Use the values in the sine-fit boxes for the current channel.
+
+        quiet=True (switching channels): invalid input is silently discarded.
+        Returns False if the input is invalid.
+        """
+        if self._closed:
+            return True
+        try:
+            options = self._read_fit_inputs()
+        except ValueError as error:
+            if quiet:
+                self._show_fit_options()
+            else:
+                self.status_var.set(f"Sine fit not changed: {error}")
+                self.win.bell()
+            return False
+        if options == self.fit_options[self.channel]:
+            return True
+        self.fit_options[self.channel] = options
+        self._fit_cache.pop(self.channel, None)
+        self._refresh_list_item(self.channel)
+        if redraw:
+            self.fit_var.set(True)
+            self._draw_full(keep_view=True)
+            self.status_var.set(self._fit_status(f"Sine fit of channel {self.channel} updated"))
+        return True
+
+    def _fit_status(self, prefix: str) -> str:
+        row = self._fit(self.channel)["row"]
+        return f"{prefix}: {row['Status']}"
+
+    def _fit_to_all(self) -> None:
+        if not self._apply_fit(redraw=False):
+            return
+        options = dict(self.fit_options[self.channel])
+        for channel in CHANNELS:
+            self.fit_options[channel] = dict(options)
+            self._refresh_list_item(channel)
+        self._fit_cache.clear()
+        self.fit_var.set(True)
+        self._draw_full(keep_view=True)
+        self.status_var.set(self._fit_status(
+            f"Sine-fit settings applied to all {len(CHANNELS)} channels (channel {self.channel}"
+        ) + ")")
+
+    def _fit_default(self) -> None:
+        self.fit_options[self.channel] = dict(self.default_fit)
+        self._fit_cache.pop(self.channel, None)
+        self._refresh_list_item(self.channel)
+        self.fit_var.set(True)
+        self._draw_full(keep_view=True)
+        self.status_var.set(
+            self._fit_status(f"Default sine-fit settings for channel {self.channel}")
+        )
+
+    def _period_from_fit(self) -> None:
+        """Use the fitted period as this channel's actogram period."""
+        detail = self._fit(self.channel)
+        if detail["fit"] is None:
+            self.status_var.set("No sine fit is available for this channel.")
+            return
+        self._set_period(self._clamp_period(round(detail["fit"]["period"], 1)))
 
     # ------------------------------------------------------------------ #
     # Actogram period
@@ -3150,7 +3763,7 @@ class ReviewWindow:
 
     def _key_zoom(self, action) -> None:
         # Typing in the entry boxes must not move the view.
-        if self.win.focus_get() in self._entry_widgets:
+        if self._typing():
             return
         action()
 
@@ -3479,12 +4092,14 @@ class ReviewWindow:
         if not path:
             return
         self._apply_period()
+        self._apply_fit(redraw=False, quiet=True)
         try:
             save_peaks_json(
                 path, self.selection, self.smooth["Hours"], self.analysis.input_path.name,
                 reg_selection={ch: self._used(ch) for ch in CHANNELS},
                 actogram_period=self.periods,
                 detrend_params=self.params,
+                fit_options=self.fit_options,
             )
         except OSError as error:
             messagebox.showerror(APP_TITLE, f"Could not save the file: {error}", parent=self.win)
@@ -3522,6 +4137,10 @@ class ReviewWindow:
             for channel, value in loaded_period.items():
                 self.periods[channel] = self._clamp_period(value)
             self.period_var.set(f"{self.day_length:g}")
+        loaded_fit = load_fit_options_json(path)
+        if loaded_fit:
+            self.fit_options.update({ch: dict(o) for ch, o in loaded_fit.items()})
+        self._fit_cache.clear()  # the detrending may have changed, too
         for channel in CHANNELS:
             self._refresh_list_item(channel)
         self._draw_full()
@@ -3532,6 +4151,7 @@ class ReviewWindow:
 
     def _close(self) -> None:
         self._closed = True
+        self._unlink_from_parent()
         try:
             self.win.grab_release()
         except tk.TclError:
@@ -3540,11 +4160,19 @@ class ReviewWindow:
 
     def _ok(self) -> None:
         self._apply_period()  # commit a value typed but not yet confirmed
+        if not self._apply_fit(redraw=False):
+            messagebox.showerror(
+                APP_TITLE,
+                "The sine-fit settings of this channel are not valid:\n" + self.status_var.get(),
+                parent=self.win,
+            )
+            return
         selection = {ch: (sorted(p), sorted(t)) for ch, (p, t) in self.selection.items()}
         reg_selection = {ch: self._used(ch) for ch in CHANNELS}
         period = dict(self.periods)
+        fit_options = {ch: dict(o) for ch, o in self.fit_options.items()}
         self._close()
-        self.on_ok(selection, reg_selection, period, dict(self.params))
+        self.on_ok(selection, reg_selection, period, dict(self.params), fit_options)
 
     def _cancel(self) -> None:
         self._close()
@@ -3561,6 +4189,16 @@ def main() -> None:
             pass
 
     root = tk.Tk()
+    if getattr(sys, "frozen", False) or sys.stderr is None:
+        # In the Windows EXE there is no console, so an unexpected error in the
+        # window would otherwise vanish silently: show it in a message box instead.
+        def report_error(exc_type, exc_value, exc_tb) -> None:
+            text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+            messagebox.showerror(
+                APP_TITLE, "Unexpected error:\n\n" + text[-3000:], parent=root
+            )
+
+        root.report_callback_exception = report_error
     if sys.platform.startswith("linux"):
         style = ttk.Style(root)
         if "clam" in style.theme_names():
