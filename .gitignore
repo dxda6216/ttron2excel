@@ -1,0 +1,16 @@
+# PyInstaller output
+build/
+dist/
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Test data / results (keep them out of the repository)
+TRACES.*
+*.xlsx
+*.pdf
+*.zip
